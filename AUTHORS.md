@@ -6,7 +6,7 @@ This is a list of the contributors of this project, as well as brief description
   - [Github](https://github.com/dbob16)
   - [Website](https://www.dilangilluly.us/)
   - [Ko-Fi](https://ko-fi.com/techguydilan)
-- Jacob Burrows - AI-powered Contribution of product completion beyond Prefix management, addition of built-in TLS on server, autodiscovery, and synchronization service. If you're a small business in need of custom applications, he may be open to doing commission work doing AI-augmented coding.
+- Jacob Burrows - Claude code specialist, project completion, backend sync feature, server admin panel introduction
   - [Github](https://github.com/jb14813)
   - [His Fork of Ticket Auction Manager Go](https://github.com/jb14813/tam-go)
   - [Ko-Fi](https://ko-fi.com/jb14813)
