@@ -185,11 +185,7 @@
 			<p>&copy; 2026 Ticket Auction Manager</p>
 			{#if !data.disableAttrib}
 				<p>
-					Created by Dilan Gilluly. <a
-						href="https://ko-fi.com/techguydilan"
-						class="text-blue-500"
-						target="_blank">My Ko-Fi</a
-					>.
+					Created by Dilan Gilluly and Jacob Burrows. More information on <a href={resolve('/credits')} class="text-blue-600">credits page.</a>
 				</p>
 			{/if}
 		</div>
