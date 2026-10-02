@@ -13,6 +13,9 @@
   pnpm_12,
   pnpmConfigHook,
   stdenvNoCC,
+  # The version both programs report (internal/version.Version); the flake
+  # passes the commit, as build.sh stamps `git describe` without a tag.
+  stamp ? "0.0.1",
 }:
 
 let
@@ -83,6 +86,7 @@ buildGo127Module {
   ldflags = [
     "-s"
     "-w"
+    "-X ticket-auction-manager/tam-go/internal/version.Version=${stamp}"
   ];
 
   preBuild = ''

@@ -1,7 +1,7 @@
 <script>
 	import { prefixPage } from '$lib/client/paths';
 	import { bS, bAS, iS, rBS } from '$lib/client/styles';
-	import { getJSON, saveMarked, saveOnLeave, errorMessage } from '$lib/client/api';
+	import { getJSON, saveMarked, saveOnLeave, errorMessage, startFrom, rowValues, TICKET_FORM } from '$lib/client/api';
 	import HeaderBar from '$lib/client/components/HeaderBar.svelte';
 	import PagerBar from '$lib/client/components/PagerBar.svelte';
 	import CommandBar from '$lib/client/components/CommandBar.svelte';
@@ -78,7 +78,7 @@
 				if (!i.pref && !i.first_name && !i.last_name && !i.phone_number) i.pref = defaultPref;
 				if (i.pref == null) i.pref = '';
 			});
-			items = [...resData];
+			items = startFrom(TICKET_FORM, resData);
 			setTimeout(() => focusIdx(0));
 		},
 		pagerFromUpdate() {
@@ -87,7 +87,8 @@
 		// Resolves to false when the marked rows could not be saved.
 		async save(opts = {}) {
 			const problem = await saveMarked('/api/tickets', itemsBuffer, {
-				keepalive: !!opts.keepalive
+				keepalive: !!opts.keepalive,
+				form: TICKET_FORM
 			});
 			// A save made as the page is hidden or closed shows nothing and leaves
 			// the cursor where it is: the volunteer may come back to the row.
@@ -136,8 +137,7 @@
 		},
 		dupDown() {
 			if (items[nextIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 't_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 't_id');
 				items[nextIdx] = { ...items[nextIdx], ...buffer, changed: true };
 				this.nextLine();
 			} else {
@@ -146,8 +146,7 @@
 		},
 		dupUp() {
 			if (curIdx > 0) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 't_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 't_id');
 				items[prevIdx] = { ...items[prevIdx], ...buffer, changed: true };
 				functions.prevLine();
 			} else {
@@ -156,15 +155,14 @@
 		},
 		copy() {
 			if (items[curIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 't_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 't_id');
 				window.localStorage.setItem('tam-ticket', JSON.stringify(buffer));
 			}
 			setTimeout(() => focusIdx(curIdx), 1);
 		},
 		paste() {
 			if (items[curIdx]) {
-				const buffer = JSON.parse(window.localStorage.getItem('tam-ticket'));
+				const buffer = rowValues(JSON.parse(window.localStorage.getItem('tam-ticket')), 't_id');
 				items[curIdx] = { ...items[curIdx], ...buffer, changed: true };
 			}
 			setTimeout(() => focusIdx(curIdx), 1);

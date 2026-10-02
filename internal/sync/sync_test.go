@@ -2,6 +2,7 @@ package sync
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,14 +15,16 @@ import (
 	"ticket-auction-manager/tam-go/internal/db"
 	"ticket-auction-manager/tam-go/internal/remote"
 	"ticket-auction-manager/tam-go/internal/store"
+	"ticket-auction-manager/tam-go/internal/version"
 )
 
 // fakeServer is a tam-server stand-in whose mood can be changed mid-test.
 type fakeServer struct {
-	mu       sync.Mutex
-	mode     string // "up", "down" (503), "nokey" (401 on everything)
-	requests []string
-	ts       *httptest.Server
+	mu         sync.Mutex
+	mode       string // "up", "down" (503), "nokey" (401 on everything)
+	requests   []string
+	heartbeats []http.Header // the headers of every GET /api
+	ts         *httptest.Server
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -31,6 +34,9 @@ func newFakeServer(t *testing.T) *fakeServer {
 		f.mu.Lock()
 		mode := f.mode
 		f.requests = append(f.requests, r.Method+" "+r.URL.RequestURI())
+		if r.URL.Path == "/api" {
+			f.heartbeats = append(f.heartbeats, r.Header.Clone())
+		}
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -48,6 +54,11 @@ func newFakeServer(t *testing.T) *fakeServer {
 		case r.URL.Path == "/api/bad":
 			w.WriteHeader(400)
 			w.Write([]byte(`{"detail":"nope"}`))
+		case r.Method == http.MethodPost:
+			// A server answers a save with the rows as it stored them: here,
+			// as they were sent.
+			body, _ := io.ReadAll(r.Body)
+			w.Write(body)
 		default:
 			w.Write([]byte(`[]`))
 		}
@@ -66,6 +77,16 @@ func (f *fakeServer) seen() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.requests...)
+}
+
+// lastHeartbeat returns the headers of the last GET /api.
+func (f *fakeServer) lastHeartbeat() http.Header {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.heartbeats) == 0 {
+		return nil
+	}
+	return f.heartbeats[len(f.heartbeats)-1]
 }
 
 func newSyncer(t *testing.T, serverURL string) (*Syncer, *store.Store) {
@@ -135,7 +156,8 @@ func TestDrainOrderFailedListAndPull(t *testing.T) {
 		t.Fatalf("after a tick with the server up: pending %d failed %d, want 0 and 1", p, fl)
 	}
 	seen := f.seen()
-	want := []string{"GET /api", "POST /api/tickets", "POST /api/bad", "POST /api/baskets", "GET /api/backuprestore"}
+	// The replay is followed at once by a heartbeat saying nothing waits.
+	want := []string{"GET /api", "POST /api/tickets", "POST /api/bad", "POST /api/baskets", "GET /api", "GET /api/backuprestore"}
 	if len(seen) != len(want) {
 		t.Fatalf("requests = %v, want %v", seen, want)
 	}
@@ -202,9 +224,9 @@ func TestServerGoesAwayAndComesBack(t *testing.T) {
 		t.Fatalf("outbox after reconnect: pending %d failed %d", p, fl)
 	}
 	seen := f.seen()
-	last := seen[len(seen)-2:]
-	if last[0] != "POST /api/tickets" || last[1] != "GET /api/backuprestore" {
-		t.Fatalf("after reconnect the queue drains, then the mirror is pulled; tail = %v", last)
+	last := seen[len(seen)-3:]
+	if last[0] != "POST /api/tickets" || last[1] != "GET /api" || last[2] != "GET /api/backuprestore" {
+		t.Fatalf("after reconnect the queue drains, a heartbeat says so, then the mirror is pulled; tail = %v", last)
 	}
 }
 
@@ -239,6 +261,46 @@ func TestUnreachableServer(t *testing.T) {
 	}
 }
 
+// TestHeartbeatCarriesTheQueuedSaves: the server's admin page shows how
+// many saves each client still has queued, so every heartbeat says so.
+func TestHeartbeatCarriesTheQueuedSaves(t *testing.T) {
+	f := newFakeServer(t)
+	s, st := newSyncer(t, f.ts.URL)
+	s.Tick()
+	hb := f.lastHeartbeat()
+	if hb == nil || hb.Get("X-TAM-Pending") != "0" || hb.Get("X-TAM-Client") != "tam-client/"+version.Version || hb.Get("TAM-KEY") != "KEY" {
+		t.Fatalf("first heartbeat = %v, want X-TAM-Pending 0, X-TAM-Client and the key", hb)
+	}
+
+	f.set("down")
+	s.Tick()
+	for _, path := range []string{"/api/tickets", "/api/baskets"} {
+		if err := s.Enqueue("POST", path, []byte(`[]`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Tick()
+	if p, _ := pendingFailed(t, st); p != 2 {
+		t.Fatalf("pending = %d, want 2 while the server is down", p)
+	}
+	if got := f.lastHeartbeat().Get("X-TAM-Pending"); got != "2" {
+		t.Fatalf("heartbeat with two queued saves said X-TAM-Pending %q, want 2", got)
+	}
+
+	// Once the server is back the queue drains, and the next heartbeat
+	// reports an empty queue.
+	f.set("up")
+	s.Reset()
+	s.Tick()
+	if p, _ := pendingFailed(t, st); p != 0 {
+		t.Fatalf("pending = %d after the server returned, want 0", p)
+	}
+	s.Tick()
+	if got := f.lastHeartbeat().Get("X-TAM-Pending"); got != "0" {
+		t.Fatalf("heartbeat after the drain said X-TAM-Pending %q, want 0", got)
+	}
+}
+
 // TestPullWaitsForSavesQueuedAfterTheReplay: a page save can be queued in
 // the moment between the replay finding nothing left to send and the pull
 // starting. The server does not have that save yet, so the pull must wait
@@ -267,13 +329,50 @@ func TestPullWaitsForSavesQueuedAfterTheReplay(t *testing.T) {
 		}
 	}
 
-	// The next tick sends the save first, then pulls.
+	// The next tick sends the save first (and says the queue is empty),
+	// then pulls.
 	s.Tick()
 	if p, _ := pendingFailed(t, st); p != 0 {
 		t.Fatalf("pending after the second tick = %d, want 0", p)
 	}
 	seen := f.seen()
-	if n := len(seen); n < 2 || seen[n-2] != "POST /api/tickets" || seen[n-1] != "GET /api/backuprestore" {
+	if n := len(seen); n < 3 || seen[n-3] != "POST /api/tickets" || seen[n-2] != "GET /api" || seen[n-1] != "GET /api/backuprestore" {
 		t.Fatalf("requests = %v, want the queued save sent before the download", seen)
+	}
+}
+
+// TestHeartbeatRightAfterTheReplay: the server's admin page shows how many
+// saves each client still has queued, from its heartbeat. Once the replay
+// has sent them the client says so at once, not at the next heartbeat, so
+// the page never shows saves that are no longer waiting.
+func TestHeartbeatRightAfterTheReplay(t *testing.T) {
+	f := newFakeServer(t)
+	s, st := newSyncer(t, f.ts.URL)
+	s.t.Heartbeat = time.Hour // only the first tick pings on its own
+	for _, path := range []string{"/api/tickets", "/api/baskets"} {
+		if err := s.Enqueue("POST", path, []byte(`[]`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Tick()
+	if p, _ := pendingFailed(t, st); p != 0 {
+		t.Fatalf("pending = %d after the replay, want 0", p)
+	}
+	queued := func() []string {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		var out []string
+		for _, h := range f.heartbeats {
+			out = append(out, h.Get("X-TAM-Pending"))
+		}
+		return out
+	}
+	if got := queued(); len(got) != 2 || got[0] != "2" || got[1] != "0" {
+		t.Fatalf("heartbeats said %v queued, want [2 0]: the queue, then nothing left", got)
+	}
+	// With nothing sent, a tick does not ping before the heartbeat is due.
+	s.Tick()
+	if got := queued(); len(got) != 2 {
+		t.Fatalf("heartbeats said %v queued, want no heartbeat from a tick that sent nothing", got)
 	}
 }

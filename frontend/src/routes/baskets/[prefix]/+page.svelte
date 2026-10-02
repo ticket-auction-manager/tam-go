@@ -1,7 +1,7 @@
 <script>
 	import { prefixPage } from '$lib/client/paths';
 	import { bS, bAS, iS, rBS } from '$lib/client/styles';
-	import { getJSON, saveMarked, saveOnLeave, errorMessage } from '$lib/client/api';
+	import { getJSON, saveMarked, saveOnLeave, errorMessage, startFrom, rowValues, BASKET_FORM } from '$lib/client/api';
 	import HeaderBar from '$lib/client/components/HeaderBar.svelte';
 	import PagerBar from '$lib/client/components/PagerBar.svelte';
 	import CommandBar from '$lib/client/components/CommandBar.svelte';
@@ -54,7 +54,7 @@
 				return;
 			}
 			resData.map((i) => (i.changed = false));
-			items = [...resData];
+			items = startFrom(BASKET_FORM, resData);
 			setTimeout(() => focusIdx(0));
 		},
 		pagerFromUpdate() {
@@ -63,7 +63,8 @@
 		// Resolves to false when the marked rows could not be saved.
 		async save(opts = {}) {
 			const problem = await saveMarked('/api/baskets', itemsBuffer, {
-				keepalive: !!opts.keepalive
+				keepalive: !!opts.keepalive,
+				form: BASKET_FORM
 			});
 			// A save made as the page is hidden or closed shows nothing and leaves
 			// the cursor where it is: the volunteer may come back to the row.
@@ -112,8 +113,7 @@
 		},
 		dupDown() {
 			if (items[nextIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 'b_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 'b_id');
 				items[nextIdx] = { ...items[nextIdx], ...buffer, changed: true };
 				this.nextLine();
 			} else {
@@ -122,8 +122,7 @@
 		},
 		dupUp() {
 			if (curIdx > 0) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 'b_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 'b_id');
 				items[prevIdx] = { ...items[prevIdx], ...buffer, changed: true };
 				this.prevLine();
 			} else {
@@ -132,15 +131,14 @@
 		},
 		copy() {
 			if (items[curIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 'b_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 'b_id');
 				window.localStorage.setItem('tam-basket', JSON.stringify(buffer));
 			}
 			focusIdx(curIdx);
 		},
 		paste() {
 			if (items[curIdx]) {
-				const buffer = JSON.parse(window.localStorage.getItem('tam-basket'));
+				const buffer = rowValues(JSON.parse(window.localStorage.getItem('tam-basket')), 'b_id');
 				items[curIdx] = { ...items[curIdx], ...buffer, changed: true };
 			}
 			focusIdx(curIdx);

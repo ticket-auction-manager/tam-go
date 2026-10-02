@@ -84,7 +84,8 @@ func (h *handler) observe(err error, res *remote.Response) bool {
 // listOr answers with a list. In remote mode it comes from the server while
 // the client is in step with it (see inStep), and is copied into the mirror
 // on the way; otherwise it comes from the mirror, which in standalone mode
-// is the only store.
+// is the only store. In remote mode an answer from the mirror carries
+// X-TAM-Copy: 1, so a report can say it may lack other computers' saves.
 func listOr[T any](h *handler, w http.ResponseWriter, rc *remote.Client, remotePath string, mirror func([]T) error, local func() ([]T, error)) {
 	if rc != nil && h.inStep() {
 		res, err := rc.WithTimeout(readTimeout).Get(remotePath)
@@ -108,6 +109,9 @@ func listOr[T any](h *handler, w http.ResponseWriter, rc *remote.Client, remoteP
 	if err != nil {
 		httpx.WriteInternal(w, err)
 		return
+	}
+	if rc != nil {
+		w.Header().Set("X-TAM-Copy", "1")
 	}
 	httpx.WriteJSON(w, http.StatusOK, out)
 }
@@ -234,33 +238,41 @@ func prefixRow(p store.Prefix) string { return tamsync.Row("prefixes", p.Prefix,
 func ticketRow(t store.Ticket) string { return tamsync.Row("tickets", t.Prefix, t.TID) }
 func basketRow(b store.Basket) string { return tamsync.Row("baskets", b.Prefix, b.BID) }
 
-// writeThrough decodes and validates a list and saves it. In remote mode
-// the server is asked first while it answers and nothing saved here waits
-// for it; otherwise the rows are kept in the mirror and queued behind the
-// saves already waiting, in one transaction, and the answer carries
-// X-TAM-Queued so a page can tell. A server that rejects the data answers
-// with its error and nothing is written anywhere. row names each item for
-// the syncer (see BeginSave); save writes the items to a store.
-func writeThrough[T any](h *handler, w http.ResponseWriter, r *http.Request, rc *remote.Client, remotePath string,
-	validate func([]T) error, row func(T) string, save func(*store.Store, []T) error) {
-	var items []T
+// writeThrough decodes and validates a form's saves (see store's saves)
+// and saves them. In remote mode the server is asked first while it answers
+// and nothing saved here waits for it; its answer, the rows as stored, goes
+// into this client's copy and back to the page, which sees from it the
+// changes the server did not make. An answer that does not list the saved
+// rows is not the server's (a Wi-Fi login page answers anything) and the
+// save is queued instead. Otherwise the saves are written into this
+// client's copy, field by field as the server would, and queued behind the
+// saves already waiting, in one transaction: without the changes this copy
+// already refused, so the server is not asked for them either. The answer
+// then carries X-TAM-Queued so a page can tell. A server that rejects the
+// data answers with its error and nothing is written anywhere. row names
+// each save for the syncer (see BeginSave); save writes the saves to a
+// store and returns the rows as stored.
+func writeThrough[S any, R any](h *handler, w http.ResponseWriter, r *http.Request, rc *remote.Client, remotePath string,
+	validate func([]S) error, row func(S) string, save func(*store.Store, []S) ([]R, error)) {
+	var items []S
 	if err := httpx.DecodeJSON(w, r, &items); err != nil {
 		httpx.WriteDecodeError(w, err)
 		return
 	}
 	if items == nil {
-		items = []T{}
+		items = []S{}
 	}
 	if err := validate(items); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	if rc == nil {
-		if err := save(h.st, items); err != nil {
+		stored, err := save(h.st, items)
+		if err != nil {
 			httpx.WriteInternal(w, err)
 			return
 		}
-		httpx.WriteJSON(w, http.StatusOK, items)
+		httpx.WriteJSON(w, http.StatusOK, stored)
 		return
 	}
 	rows := make([]string, len(items))
@@ -292,20 +304,43 @@ func writeThrough[T any](h *handler, w http.ResponseWriter, r *http.Request, rc 
 				forward(w, res)
 				return
 			}
-			if err := save(h.st, items); err != nil {
-				httpx.WriteInternal(w, err)
+			result, err := store.ResultOf(remotePath, body, res.Body)
+			if err == nil {
+				if err := result.Write(h.st); err != nil {
+					httpx.WriteInternal(w, err)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(res.Body)
 				return
 			}
-			httpx.WriteJSON(w, http.StatusOK, items)
-			return
+			// Not the server's answer: the save may not have reached it.
+			// The queue sends it again; the server takes a repeat once.
+			h.sync.NoteFailure(fmt.Errorf("%s answered a save with something other than the saved rows", remotePath))
 		}
 	}
-	if err := h.sync.SaveQueued(http.MethodPost, remotePath, body, order, func(st *store.Store) error { return save(st, items) }); err != nil {
+	var stored []R
+	err = h.sync.SaveQueuedAs(http.MethodPost, remotePath, order, func(st *store.Store) ([]byte, error) {
+		var err error
+		if stored, err = save(st, items); err != nil {
+			return nil, err
+		}
+		answer, err := json.Marshal(stored)
+		if err != nil {
+			return nil, err
+		}
+		result, err := store.ResultOf(remotePath, body, answer)
+		if err != nil {
+			return nil, err
+		}
+		return result.Kept, nil
+	})
+	if err != nil {
 		httpx.WriteInternal(w, err)
 		return
 	}
 	w.Header().Set("X-TAM-Queued", "1")
-	httpx.WriteJSON(w, http.StatusOK, items)
+	httpx.WriteJSON(w, http.StatusOK, stored)
 }
 
 // --- root and settings ---
@@ -418,7 +453,8 @@ func (h *handler) listPrefixes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postPrefixes(w http.ResponseWriter, r *http.Request) {
-	writeThrough(h, w, r, h.remote(h.settings()), "/api/prefixes", store.ValidatePrefixes, prefixRow, (*store.Store).UpsertPrefixes)
+	writeThrough(h, w, r, h.remote(h.settings()), "/api/prefixes", store.ValidatePrefixSaves,
+		func(p store.PrefixSave) string { return prefixRow(p.Prefix) }, (*store.Store).SavePrefixes)
 }
 
 // deletePrefix removes a prefix on the server (in remote mode) and in the
@@ -539,7 +575,8 @@ func (h *handler) ticketRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postTickets(w http.ResponseWriter, r *http.Request) {
-	writeThrough(h, w, r, h.remote(h.settings()), "/api/tickets", store.ValidateTickets, ticketRow, (*store.Store).UpsertTickets)
+	writeThrough(h, w, r, h.remote(h.settings()), "/api/tickets", store.ValidateTicketSaves,
+		func(t store.TicketSave) string { return ticketRow(t.Ticket) }, (*store.Store).SaveTickets)
 }
 
 func (h *handler) searchTickets(w http.ResponseWriter, r *http.Request) {
@@ -554,7 +591,8 @@ func (h *handler) searchTickets(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postSearch(w http.ResponseWriter, r *http.Request) {
-	writeThrough(h, w, r, h.remote(h.settings()), "/api/search/tickets", store.ValidateTickets, ticketRow, (*store.Store).UpsertTickets)
+	writeThrough(h, w, r, h.remote(h.settings()), "/api/search/tickets", store.ValidateTicketSaves,
+		func(t store.TicketSave) string { return ticketRow(t.Ticket) }, (*store.Store).SaveTickets)
 }
 
 // --- baskets ---
@@ -598,7 +636,8 @@ func (h *handler) basketRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postBaskets(w http.ResponseWriter, r *http.Request) {
-	writeThrough(h, w, r, h.remote(h.settings()), "/api/baskets", store.ValidateBaskets, basketRow, (*store.Store).UpsertBaskets)
+	writeThrough(h, w, r, h.remote(h.settings()), "/api/baskets", store.ValidateBasketSaves,
+		func(b store.BasketSave) string { return basketRow(b.Basket) }, (*store.Store).SaveBaskets)
 }
 
 // --- drawing ---
@@ -613,7 +652,7 @@ func drawingPlaceholder(prefix string) func(id int) store.DrawingLine {
 func (h *handler) mirrorDrawing(lines []store.DrawingLine) error {
 	bs := make([]store.Basket, 0, len(lines))
 	for _, l := range lines {
-		bs = append(bs, store.Basket{Prefix: l.Prefix, BID: l.BID, Description: l.Description, WinningTicket: l.WinningTicket})
+		bs = append(bs, store.Basket{Prefix: l.Prefix, BID: l.BID, Description: l.Description, WinningTicket: l.WinningTicket, WinRev: l.WinRev})
 	}
 	return h.st.UpsertWinning(bs)
 }
@@ -653,7 +692,8 @@ func (h *handler) drawingRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postDrawing(w http.ResponseWriter, r *http.Request) {
-	writeThrough(h, w, r, h.remote(h.settings()), "/api/drawing", store.ValidateBaskets, basketRow, (*store.Store).UpsertWinning)
+	writeThrough(h, w, r, h.remote(h.settings()), "/api/drawing", store.ValidateDrawingSaves,
+		func(d store.DrawingSave) string { return basketRow(d.Basket) }, (*store.Store).SaveWinning)
 }
 
 // --- reports ---
@@ -745,7 +785,7 @@ func (h *handler) importRemote(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	res, err := restoreInto(rc, bf)
+	res, err := rc.Post("/api/backuprestore", bf)
 	if err != nil {
 		h.unreachable(w, err)
 		return
@@ -757,22 +797,14 @@ func (h *handler) importRemote(w http.ResponseWriter, r *http.Request) {
 	httpx.WriteJSON(w, http.StatusOK, map[string]string{"message": "Backup file imported successfully."})
 }
 
-// restoreInto sends a backup to the server, then the winning tickets a
-// second time through the drawing route. The original server's restore
-// leaves the winning ticket of a basket it already has untouched, and the
-// drawing route is what sets it on every server, so the restore comes out
-// complete on both.
-func restoreInto(rc *remote.Client, bf store.BackupFile) (*remote.Response, error) {
-	res, err := rc.Post("/api/backuprestore", bf)
-	if err != nil || !res.OK() || len(bf.Baskets) == 0 {
-		return res, err
-	}
-	return rc.Post("/api/drawing", bf.Baskets)
-}
-
-// push sends one local table to the server. The page sends an empty JSON
-// object as the body; requiring it keeps the Content-Type barrier that
-// stops cross-site form posts.
+// push sends one table of this client's copy to the server, which keeps of
+// it only the rows newer than its own (X-TAM-Merge: newer, see
+// store.MergeNewer): rows the server does not have, and rows changed later
+// than the server's copy of them. The copy names its event, and a server
+// holding another event refuses it. Push waits until this client's queued
+// saves have reached the server, as they are newer than the copy. The page
+// sends an empty JSON object as the body; requiring it keeps the
+// Content-Type barrier that stops cross-site form posts.
 func (h *handler) push(w http.ResponseWriter, r *http.Request) {
 	var ignored json.RawMessage
 	if err := httpx.DecodeJSON(w, r, &ignored); err != nil {
@@ -780,21 +812,8 @@ func (h *handler) push(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	target := r.PathValue("target")
-	bf := store.NewBackupFile()
-	var err error
-	switch target {
-	case "prefixes":
-		bf.Prefixes, err = h.st.ListPrefixes()
-	case "tickets":
-		bf.Tickets, err = h.st.AllTickets()
-	case "baskets":
-		bf.Baskets, err = h.st.AllBaskets()
-	default:
+	if target != "prefixes" && target != "tickets" && target != "baskets" {
 		httpx.WriteError(w, http.StatusBadRequest, "Can only push prefixes, tickets, or baskets.")
-		return
-	}
-	if err != nil {
-		httpx.WriteInternal(w, err)
 		return
 	}
 	rc := h.remote(h.settings())
@@ -802,7 +821,33 @@ func (h *handler) push(w http.ResponseWriter, r *http.Request) {
 		httpx.WriteError(w, http.StatusInternalServerError, "Server not set.")
 		return
 	}
-	res, err := restoreInto(rc, bf)
+	if waiting, err := h.st.OutboxWaiting(); err != nil || waiting {
+		if err != nil {
+			httpx.WriteInternal(w, err)
+			return
+		}
+		httpx.WriteError(w, http.StatusConflict, "This client still has saves waiting for the server; push once they have been sent.")
+		return
+	}
+	bf := store.NewBackupFile()
+	var err error
+	if bf.Event, err = h.st.MirrorEvent(); err != nil {
+		httpx.WriteInternal(w, err)
+		return
+	}
+	switch target {
+	case "prefixes":
+		bf.Prefixes, err = h.st.ListPrefixes()
+	case "tickets":
+		bf.Tickets, err = h.st.AllTickets()
+	case "baskets":
+		bf.Baskets, err = h.st.AllBaskets()
+	}
+	if err != nil {
+		httpx.WriteInternal(w, err)
+		return
+	}
+	res, err := rc.Do(http.MethodPost, "/api/backuprestore", map[string]string{"X-TAM-Merge": "newer"}, bf)
 	if err != nil {
 		h.unreachable(w, err)
 		return
@@ -811,6 +856,13 @@ func (h *handler) push(w http.ResponseWriter, r *http.Request) {
 		forward(w, res)
 		return
 	}
+	var answer struct {
+		Message string `json:"message"`
+	}
 	label := strings.ToUpper(target[:1]) + target[1:]
-	httpx.WriteJSON(w, http.StatusOK, map[string]string{"message": label + " pushed successfully."})
+	msg := label + " pushed."
+	if res.JSON(&answer) == nil && answer.Message != "" {
+		msg += " " + answer.Message
+	}
+	httpx.WriteJSON(w, http.StatusOK, map[string]string{"message": msg})
 }

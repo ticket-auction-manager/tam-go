@@ -6,7 +6,8 @@ import (
 )
 
 // ClientTables are the tables only tam-client has: the outbox of saves that
-// have not reached the server yet, and the ones the server rejected.
+// have not reached the server yet, the ones the server rejected, the
+// client's save numbers and the event its copy belongs to.
 var ClientTables = []string{
 	`CREATE TABLE IF NOT EXISTS outbox (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -32,6 +33,12 @@ var ClientTables = []string{
 		client TEXT NOT NULL,
 		host TEXT NOT NULL,
 		last_save INTEGER NOT NULL)`,
+	// mirror names the event the client's copy belongs to (see
+	// store.MirrorEvent): one row, once the client has met a server that
+	// names its event.
+	`CREATE TABLE IF NOT EXISTS mirror (
+		id INTEGER PRIMARY KEY CHECK (id = 1),
+		event TEXT NOT NULL)`,
 }
 
 // clientColumns were added to the client tables after they first shipped:
@@ -44,7 +51,7 @@ var clientColumns = []struct{ table, column, decl string }{
 }
 
 // MigrateClient creates the client-only tables. It runs after Migrate and
-// is safe to run on every start; the original app ignores these tables.
+// is safe to run on every start.
 func MigrateClient(sqldb *sql.DB) error {
 	for _, stmt := range ClientTables {
 		if _, err := sqldb.Exec(stmt); err != nil {

@@ -9,30 +9,43 @@
 	let currentTimeout = $state();
 	let lastRefreshed = $state('');
 	let interval = $state('0');
+	// Why the last refresh failed; the figures shown stay those of lastRefreshed.
+	let problem = $state('');
+	let fromCopy = $state(false);
 
 	// alive is cleared when the page goes away so a refresh that was in
 	// flight cannot schedule the next one.
 	let alive = true;
+	// A failed refresh keeps the figures shown and says why; with an interval
+	// chosen, the next refresh is tried all the same.
 	const loadCounts = async () => {
-		const rtnData = {};
+		clearTimeout(currentTimeout);
 		let res;
 		try {
 			res = await fetch('/api/reports/counts');
 		} catch {
-			return;
+			res = null;
 		}
 		if (!alive) return;
-		if (res.ok) {
+		if (!res) {
+			problem = 'Could not reach the TAM client program.';
+		} else if (!res.ok) {
+			problem = `The counts could not be read (${res.status}).`;
+		} else {
+			const rtnData = {};
+			// The total row is keyed apart: a prefix may be named Total, but no
+			// prefix name holds a slash.
+			const key = (c) => (c.is_total ? '/total' : c.prefix);
 			prefixes.forEach((p) => (rtnData[p.prefix] = { ...p }));
 			const resData = await res.json();
-			resData.forEach((c) => (rtnData[c.prefix] = { ...rtnData[c.prefix], ...c }));
+			resData.forEach((c) => (rtnData[key(c)] = { ...rtnData[key(c)], ...c, key: key(c) }));
 			tableData = [...Object.values(rtnData)];
-			const now = new Date();
-			lastRefreshed = now.toLocaleString();
-			clearTimeout(currentTimeout);
-			if (interval > 0) {
-				currentTimeout = setTimeout(loadCounts, interval);
-			}
+			fromCopy = res.headers.get('X-TAM-Copy') === '1';
+			problem = '';
+			lastRefreshed = new Date().toLocaleString();
+		}
+		if (interval > 0) {
+			currentTimeout = setTimeout(loadCounts, interval);
 		}
 	};
 
@@ -64,7 +77,7 @@
 			</tr>
 		</thead>
 		<tbody>
-			{#each tableData as line (line.prefix)}
+			{#each tableData as line (line.key ?? line.prefix)}
 				<tr class={tS[line.color] || ''}>
 					<td class="border p-0.5">{line.prefix}</td>
 					<td class="border p-0.5">{line.unique_buyers || 0}</td>
@@ -85,4 +98,13 @@
 		>
 		<div>Last refreshed: {lastRefreshed}</div>
 	</div>
+	{#if problem}
+		<p class="text-red-700">{problem} The figures shown are from {lastRefreshed || 'no refresh yet'}.</p>
+	{/if}
+	{#if fromCopy}
+		<p class="text-red-700 font-bold">
+			From this computer's copy: the server could not be reached. Tickets entered on other computers
+			since this one last reached the server are not counted.
+		</p>
+	{/if}
 </div>

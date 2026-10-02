@@ -35,6 +35,18 @@ var Tables = []string{
 		description TEXT)`,
 }
 
+// revColumns are the order numbers (see store.Event): the server stamps
+// each change it accepts with the next one, and every client keeps the
+// numbers in its copy, so a copy of a row can tell whether it is older than
+// what a server holds. A basket has two, as its description and donors are
+// saved apart from its winning ticket.
+var revColumns = []struct{ table, column string }{
+	{"prefixes", "rev"},
+	{"tickets", "rev"},
+	{"baskets", "rev"},
+	{"baskets", "win_rev"},
+}
+
 // View is a named view definition. Views are recreated on every start so a
 // database written by an older version (or by the original app, whose
 // server labelled the counts total "Totals") ends up with the current
@@ -50,7 +62,7 @@ type View struct {
 // basket still to draw.
 var Views = []View{
 	{"drawing", `CREATE VIEW drawing AS
-		SELECT b.prefix, b.b_id, b.description, b.winning_ticket, t.last_name, t.first_name, t.phone_number
+		SELECT b.prefix, b.b_id, b.description, b.winning_ticket, t.last_name, t.first_name, t.phone_number, b.win_rev
 		FROM baskets b LEFT JOIN tickets t ON b.prefix = t.prefix AND b.winning_ticket = t.t_id AND b.winning_ticket > 0
 		ORDER BY b.prefix, b.b_id`},
 	{"report_by_name", `CREATE VIEW report_by_name AS
@@ -61,13 +73,18 @@ var Views = []View{
 		SELECT b.prefix, b.b_id, b.description, b.donors, b.winning_ticket, t.last_name, t.first_name, t.phone_number, t.pref
 		FROM baskets b LEFT JOIN tickets t ON b.prefix = t.prefix AND b.winning_ticket = t.t_id AND b.winning_ticket > 0
 		ORDER BY b.prefix, b.b_id`},
+	// A buyer is a first name, last name and phone number together; joined
+	// into one text, "Jo Ann" and "Joa Nn" would be one buyer. The total
+	// row is marked as such, so a prefix named Total stays a row of its own.
 	{"report_counts", `CREATE VIEW report_counts AS
-		SELECT prefix, COUNT(DISTINCT(CONCAT(first_name, last_name, phone_number))) AS unique_buyers, COUNT(*) AS total_buys
-		FROM tickets
+		SELECT prefix, 0 AS is_total, COUNT(*) AS unique_buyers, SUM(purchases) AS total_buys
+		FROM (SELECT prefix, first_name, last_name, phone_number, COUNT(*) AS purchases
+			FROM tickets GROUP BY prefix, first_name, last_name, phone_number)
 		GROUP BY prefix
 		UNION ALL
-		SELECT 'Total', COUNT(DISTINCT(CONCAT(first_name, last_name, phone_number))), COUNT(*)
-		FROM tickets`},
+		SELECT 'Total', 1, COUNT(*), coalesce(SUM(purchases), 0)
+		FROM (SELECT first_name, last_name, phone_number, COUNT(*) AS purchases
+			FROM tickets GROUP BY first_name, last_name, phone_number)`},
 }
 
 // Open opens (and creates when missing) the SQLite database at path with a
@@ -91,12 +108,24 @@ func Open(path string) (*sql.DB, error) {
 	return sqldb, nil
 }
 
-// Migrate creates missing tables and recreates the views. It is safe to
-// run on every start.
+// Migrate creates missing tables and columns and recreates the views. It is
+// safe to run on every start.
 func Migrate(sqldb *sql.DB) error {
 	for _, stmt := range Tables {
 		if _, err := sqldb.Exec(stmt); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
+		}
+	}
+	for _, c := range revColumns {
+		has, err := hasColumn(sqldb, c.table, c.column)
+		if err != nil {
+			return err
+		}
+		if has {
+			continue
+		}
+		if _, err := sqldb.Exec(`ALTER TABLE ` + c.table + ` ADD COLUMN ` + c.column + ` INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("add %s.%s: %w", c.table, c.column, err)
 		}
 	}
 	for _, v := range Views {

@@ -86,7 +86,7 @@ func (s *Store) tx(fn func(*sql.Tx) error) error {
 
 // --- prefixes ---
 
-const prefixCols = `prefix, color, weight`
+const prefixCols = `prefix, color, weight, rev`
 
 func scanPrefixes(rows *sql.Rows) ([]Prefix, error) {
 	defer rows.Close()
@@ -95,7 +95,7 @@ func scanPrefixes(rows *sql.Rows) ([]Prefix, error) {
 		var p Prefix
 		var color sql.NullString
 		var weight sql.NullInt64
-		if err := rows.Scan(&p.Prefix, &color, &weight); err != nil {
+		if err := rows.Scan(&p.Prefix, &color, &weight, &p.Rev); err != nil {
 			return nil, err
 		}
 		p.Color, p.Weight = nstr(color), nint(weight)
@@ -113,33 +113,66 @@ func (s *Store) ListPrefixes() ([]Prefix, error) {
 	return scanPrefixes(rows)
 }
 
-const upsertPrefixSQL = `INSERT INTO prefixes (prefix, color, weight) VALUES (?, ?, ?)
-	ON CONFLICT (prefix) DO UPDATE SET color = EXCLUDED.color, weight = EXCLUDED.weight`
+// PrefixByName returns one prefix, or nil when it does not exist.
+func (s *Store) PrefixByName(name string) (*Prefix, error) {
+	rows, err := s.db.Query(`SELECT `+prefixCols+` FROM prefixes WHERE prefix = ?`, name)
+	if err != nil {
+		return nil, err
+	}
+	ps, err := scanPrefixes(rows)
+	if err != nil || len(ps) == 0 {
+		return nil, err
+	}
+	return &ps[0], nil
+}
 
-// UpsertPrefixes inserts or updates the given prefixes in one transaction.
+// upsertPrefixSQL writes a whole prefix with its order number.
+const upsertPrefixSQL = `INSERT INTO prefixes (prefix, color, weight, rev) VALUES (?, ?, ?, ?)
+	ON CONFLICT (prefix) DO UPDATE SET color = EXCLUDED.color, weight = EXCLUDED.weight, rev = EXCLUDED.rev`
+
+// prefixArgs are the arguments of upsertPrefixSQL.
+func prefixArgs(p Prefix) []any { return []any{p.Prefix, p.Color, p.Weight, p.Rev} }
+
+// UpsertPrefixes writes whole prefixes, with their order numbers, in one
+// transaction: what the server answered, into a client's copy.
 func (s *Store) UpsertPrefixes(ps []Prefix) error {
 	return s.tx(func(tx *sql.Tx) error {
-		return execEach(tx, upsertPrefixSQL, len(ps), func(i int) []any {
-			return []any{ps[i].Prefix, ps[i].Color, ps[i].Weight}
-		})
+		return execEach(tx, upsertPrefixSQL, len(ps), func(i int) []any { return prefixArgs(ps[i]) })
 	})
 }
 
 // DeletePrefix removes a prefix and returns the deleted row, or nil when
-// there was none.
+// there was none. On a server the delete gets an order number of its own,
+// kept in deleted_prefixes, so an older copy of the prefix cannot bring it
+// back (see MergeNewer). Its tickets and baskets stay.
 func (s *Store) DeletePrefix(name string) (*Prefix, error) {
-	var p Prefix
-	var color sql.NullString
-	var weight sql.NullInt64
-	err := s.execReturning(`DELETE FROM prefixes WHERE prefix = ? RETURNING prefix, color, weight`, []any{name}, &p.Prefix, &color, &weight)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	p.Color, p.Weight = nstr(color), nint(weight)
-	return &p, nil
+	var gone *Prefix
+	err := s.tx(func(tx *sql.Tx) error {
+		var p Prefix
+		var color sql.NullString
+		var weight sql.NullInt64
+		err := tx.QueryRow(`DELETE FROM prefixes WHERE prefix = ? RETURNING prefix, color, weight, rev`, name).Scan(&p.Prefix, &color, &weight, &p.Rev)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		p.Color, p.Weight = nstr(color), nint(weight)
+		gone = &p
+		ev, err := eventIn(tx)
+		if err != nil || ev == nil {
+			return err
+		}
+		rev, err := nextRev(tx)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`INSERT INTO deleted_prefixes (prefix, rev) VALUES (?, ?)
+			ON CONFLICT (prefix) DO UPDATE SET rev = excluded.rev`, name, rev)
+		return err
+	})
+	return gone, err
 }
 
 // execEach prepares query once inside tx and executes it n times with the
@@ -187,15 +220,16 @@ func (s *Store) hasKeyActivity() (bool, error) {
 }
 
 // ListKeys returns every access key ordered by description, then key.
-// LastSeen is filled in on a database with auth_key_activity.
+// LastSeen and LastUpdate are filled in on a database with
+// auth_key_activity.
 func (s *Store) ListKeys() ([]AuthKey, error) {
-	withSeen, err := s.hasKeyActivity()
+	withActivity, err := s.hasKeyActivity()
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT auth_key, description, NULL FROM auth_keys ORDER BY description, auth_key`
-	if withSeen {
-		query = `SELECT k.auth_key, k.description, a.last_seen FROM auth_keys k
+	query := `SELECT auth_key, description, NULL, NULL FROM auth_keys ORDER BY description, auth_key`
+	if withActivity {
+		query = `SELECT k.auth_key, k.description, a.last_seen, a.last_update FROM auth_keys k
 			LEFT JOIN auth_key_activity a ON a.auth_key = k.auth_key
 			ORDER BY k.description, k.auth_key`
 	}
@@ -207,11 +241,11 @@ func (s *Store) ListKeys() ([]AuthKey, error) {
 	out := []AuthKey{}
 	for rows.Next() {
 		var k AuthKey
-		var desc, seen sql.NullString
-		if err := rows.Scan(&k.AuthKey, &desc, &seen); err != nil {
+		var desc, seen, updated sql.NullString
+		if err := rows.Scan(&k.AuthKey, &desc, &seen, &updated); err != nil {
 			return nil, err
 		}
-		k.Description, k.LastSeen = nstr(desc), nstr(seen)
+		k.Description, k.LastSeen, k.LastUpdate = nstr(desc), nstr(seen), nstr(updated)
 		out = append(out, k)
 	}
 	return out, rows.Err()
@@ -223,6 +257,16 @@ func (s *Store) TouchKey(key string) error {
 	_, err := s.exec(`INSERT INTO auth_key_activity (auth_key, last_seen)
 		SELECT auth_key, ? FROM auth_keys WHERE auth_key = ?
 		ON CONFLICT (auth_key) DO UPDATE SET last_seen = excluded.last_seen`, time.Now().UTC().Format(time.RFC3339), key)
+	return err
+}
+
+// MarkKeyUpdated records now as the key's last_update time, the time of
+// its last accepted write. It needs the table db.MigrateServer adds; a
+// missing key is not an error and gets no row.
+func (s *Store) MarkKeyUpdated(key string) error {
+	_, err := s.exec(`INSERT INTO auth_key_activity (auth_key, last_update)
+		SELECT auth_key, ? FROM auth_keys WHERE auth_key = ?
+		ON CONFLICT (auth_key) DO UPDATE SET last_update = excluded.last_update`, time.Now().UTC().Format(time.RFC3339), key)
 	return err
 }
 
@@ -303,10 +347,15 @@ func (s *Store) Counts() (prefixes, tickets, baskets int, err error) {
 
 // --- backup and restore ---
 
-// Export returns every prefix, basket and ticket.
+// Export returns every prefix, basket and ticket with their order numbers,
+// and the event they belong to: on a server the one it holds (see Event),
+// on a client the one of its copy (see MirrorEvent).
 func (s *Store) Export() (BackupFile, error) {
 	bf := NewBackupFile()
 	var err error
+	if bf.Event, err = s.eventName(); err != nil {
+		return bf, err
+	}
 	if bf.Prefixes, err = s.ListPrefixes(); err != nil {
 		return bf, err
 	}
@@ -319,28 +368,35 @@ func (s *Store) Export() (BackupFile, error) {
 	return bf, nil
 }
 
-// Import upserts every row of a backup file in one transaction. Existing
-// rows are overwritten, which is what a restore is for.
+// Import writes every row of a backup file in one transaction, with the
+// order numbers the file gives them (0 where it has none). Existing rows are
+// overwritten, which is what a restore is for. On a server the file's event
+// becomes the server's, when the file names one, and the order numbers go
+// on from the highest in the file, so a later change is always newer; a
+// prefix the file holds is no longer counted as deleted.
 func (s *Store) Import(bf BackupFile) error {
 	return s.tx(func(tx *sql.Tx) error {
-		if err := execEach(tx, upsertPrefixSQL, len(bf.Prefixes), func(i int) []any {
-			p := bf.Prefixes[i]
-			return []any{p.Prefix, p.Color, p.Weight}
-		}); err != nil {
+		if err := execEach(tx, upsertPrefixSQL, len(bf.Prefixes), func(i int) []any { return prefixArgs(bf.Prefixes[i]) }); err != nil {
 			return fmt.Errorf("prefixes: %w", err)
 		}
-		if err := execEach(tx, restoreBasketSQL, len(bf.Baskets), func(i int) []any {
-			b := bf.Baskets[i]
-			return []any{b.Prefix, b.BID, b.Description, b.Donors, b.WinningTicket}
-		}); err != nil {
+		if err := execEach(tx, upsertBasketSQL, len(bf.Baskets), func(i int) []any { return basketArgs(bf.Baskets[i]) }); err != nil {
 			return fmt.Errorf("baskets: %w", err)
 		}
-		if err := execEach(tx, upsertTicketSQL, len(bf.Tickets), func(i int) []any {
-			t := bf.Tickets[i]
-			return []any{t.Prefix, t.TID, t.FirstName, t.LastName, t.PhoneNumber, t.Pref}
-		}); err != nil {
+		if err := execEach(tx, upsertTicketSQL, len(bf.Tickets), func(i int) []any { return ticketArgs(bf.Tickets[i]) }); err != nil {
 			return fmt.Errorf("tickets: %w", err)
 		}
-		return nil
+		ev, err := eventIn(tx)
+		if err != nil || ev == nil {
+			return err
+		}
+		if err := execEach(tx, `DELETE FROM deleted_prefixes WHERE prefix = ?`, len(bf.Prefixes), func(i int) []any { return []any{bf.Prefixes[i].Prefix} }); err != nil {
+			return err
+		}
+		if bf.Event != "" && bf.Event != ev.Event {
+			if _, err := tx.Exec(`UPDATE event SET event = ? WHERE id = 1`, bf.Event); err != nil {
+				return err
+			}
+		}
+		return raiseRev(tx, maxRev(bf))
 	})
 }

@@ -255,7 +255,7 @@ func describe(t store.Ticket) string {
 }
 
 // counts is the counts report the saved tickets call for, by prefix, with
-// "Total" for all of them.
+// the total row "Total" for all of them.
 func (ev *event) counts() map[string]store.ReportCountLine {
 	ev.mu.Lock()
 	defer ev.mu.Unlock()
@@ -266,10 +266,11 @@ func (ev *event) counts() map[string]store.ReportCountLine {
 			if buyers[p] == nil {
 				buyers[p] = map[string]bool{}
 			}
-			// The view counts distinct first name, last name and phone run together.
-			buyers[p][t.FirstName+t.LastName+t.PhoneNumber] = true
+			// A buyer is a first name, last name and phone number together.
+			buyers[p][t.FirstName+"\x00"+t.LastName+"\x00"+t.PhoneNumber] = true
 			line := out[p]
 			line.Prefix, line.TotalBuys, line.UniqueBuyers = p, line.TotalBuys+1, len(buyers[p])
+			line.IsTotal = p == "Total"
 			out[p] = line
 		}
 	}

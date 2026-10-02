@@ -156,7 +156,7 @@ func FuzzTicketRoundTrip(f *testing.F) {
 		if !accepted {
 			t.Fatalf("POST /api/tickets %s = 200 %s, want it refused", clip(body), clip(resp))
 		}
-		if saved := decode[[]store.Ticket](t, resp); len(saved) != len(items) || saved[len(saved)-1] != want {
+		if saved := decode[[]store.Ticket](t, resp); len(saved) != len(items) || valT(saved[len(saved)-1]) != want {
 			t.Fatalf("POST /api/tickets answered %+v, want %d rows ending with %+v", saved, len(items), want)
 		}
 		if queued {
@@ -171,24 +171,24 @@ func FuzzTicketRoundTrip(f *testing.F) {
 		}
 		notQueued(t, fx)
 		for i, st := range sts {
-			if got, err := st.Ticket(want.Prefix, want.TID); err != nil || got == nil || *got != want {
+			if got, err := st.Ticket(want.Prefix, want.TID); err != nil || got == nil || valT(*got) != want {
 				t.Fatalf("%s has %+v (%v), want %+v", side(i), got, err, want)
 			}
-			if got, err := st.Ticket(nb.Prefix, nb.TID); err != nil || got == nil || *got != nb {
+			if got, err := st.Ticket(nb.Prefix, nb.TID); err != nil || got == nil || valT(*got) != nb {
 				t.Fatalf("the save changed the neighbour in %s to %+v (%v)", side(i), got, err)
 			}
 		}
-		if all := get[[]store.Ticket](t, fx, "/api/tickets"); !slices.Contains(all, want) {
+		if all := get[[]store.Ticket](t, fx, "/api/tickets"); !slices.Contains(valsT(all), want) {
 			t.Fatalf("GET /api/tickets lacks %+v", want)
 		}
 		if inPath(want.Prefix) {
 			ids := strconv.Itoa(want.TID)
 			for _, esc := range escapes {
 				seg := esc.fn(want.Prefix)
-				if one := get[store.Ticket](t, fx, "/api/tickets/"+seg+"/"+ids); one != want {
+				if one := get[store.Ticket](t, fx, "/api/tickets/"+seg+"/"+ids); valT(one) != want {
 					t.Fatalf("the single ticket with the prefix escaped by %s is %+v, want %+v", esc.name, one, want)
 				}
-				if rng := get[[]store.Ticket](t, fx, "/api/tickets/"+seg+"/"+ids+"/"+ids); len(rng) != 1 || rng[0] != want {
+				if rng := get[[]store.Ticket](t, fx, "/api/tickets/"+seg+"/"+ids+"/"+ids); len(rng) != 1 || valT(rng[0]) != want {
 					t.Fatalf("the range with the prefix escaped by %s is %+v, want only %+v", esc.name, rng, want)
 				}
 				list := get[[]store.Ticket](t, fx, "/api/tickets/"+seg)
@@ -197,13 +197,13 @@ func FuzzTicketRoundTrip(f *testing.F) {
 						t.Fatalf("the list of %s escaped by %s holds a ticket of %s", clip(want.Prefix), esc.name, clip(row.Prefix))
 					}
 				}
-				if !slices.Contains(list, want) {
+				if !slices.Contains(valsT(list), want) {
 					t.Fatalf("the list of the prefix escaped by %s lacks %+v", esc.name, want)
 				}
 			}
 		}
 		q := url.Values{"first_name": {want.FirstName}, "last_name": {want.LastName}, "phone_number": {want.PhoneNumber}}
-		if found := get[[]store.Ticket](t, fx, "/api/search/tickets?"+q.Encode()); !slices.Contains(found, want) {
+		if found := get[[]store.Ticket](t, fx, "/api/search/tickets?"+q.Encode()); !slices.Contains(valsT(found), want) {
 			t.Fatalf("a search for the ticket's own fields found %d tickets, not %+v", len(found), want)
 		}
 		if len(sts) == 2 {
@@ -343,14 +343,14 @@ func FuzzBasketRoundTrip(f *testing.F) {
 		}
 		notQueued(t, fx)
 		for i, st := range sts {
-			if got, err := st.Basket(want.Prefix, want.BID); err != nil || got == nil || *got != want {
+			if got, err := st.Basket(want.Prefix, want.BID); err != nil || got == nil || valB(*got) != want {
 				t.Fatalf("after POST %s %s has %+v (%v), want %+v", route, side(i), got, err, want)
 			}
-			if got, err := st.Basket(nb.Prefix, nb.BID); err != nil || got == nil || *got != nb {
+			if got, err := st.Basket(nb.Prefix, nb.BID); err != nil || got == nil || valB(*got) != nb {
 				t.Fatalf("POST %s changed the neighbour in %s to %+v (%v)", route, side(i), got, err)
 			}
 		}
-		if all := get[[]store.Basket](t, fx, "/api/baskets"); !slices.Contains(all, want) {
+		if all := get[[]store.Basket](t, fx, "/api/baskets"); !slices.Contains(valsB(all), want) {
 			t.Fatalf("GET /api/baskets lacks %+v", want)
 		}
 		if !inPath(want.Prefix) {
@@ -360,16 +360,16 @@ func FuzzBasketRoundTrip(f *testing.F) {
 		line := store.DrawingLine{Prefix: want.Prefix, BID: want.BID, Description: want.Description, WinningTicket: want.WinningTicket}
 		for _, esc := range escapes {
 			seg := esc.fn(want.Prefix)
-			if one := get[store.Basket](t, fx, "/api/baskets/"+seg+"/"+ids); one != want {
+			if one := get[store.Basket](t, fx, "/api/baskets/"+seg+"/"+ids); valB(one) != want {
 				t.Fatalf("the single basket with the prefix escaped by %s is %+v, want %+v", esc.name, one, want)
 			}
-			if rng := get[[]store.Basket](t, fx, "/api/baskets/"+seg+"/"+ids+"/"+ids); len(rng) != 1 || rng[0] != want {
+			if rng := get[[]store.Basket](t, fx, "/api/baskets/"+seg+"/"+ids+"/"+ids); len(rng) != 1 || valB(rng[0]) != want {
 				t.Fatalf("the range with the prefix escaped by %s is %+v, want only %+v", esc.name, rng, want)
 			}
-			if list := get[[]store.Basket](t, fx, "/api/baskets/"+seg); !slices.Contains(list, want) {
+			if list := get[[]store.Basket](t, fx, "/api/baskets/"+seg); !slices.Contains(valsB(list), want) {
 				t.Fatalf("the list of the prefix escaped by %s lacks %+v", esc.name, want)
 			}
-			if got := get[store.DrawingLine](t, fx, "/api/drawing/"+seg+"/"+ids); got != line {
+			if got := get[store.DrawingLine](t, fx, "/api/drawing/"+seg+"/"+ids); valD(got) != line {
 				t.Fatalf("the drawing line with the prefix escaped by %s is %+v, want %+v", esc.name, got, line)
 			}
 			report := get[[]store.ReportByBasketLine](t, fx, "/api/reports/bybasket/"+seg)
@@ -472,15 +472,15 @@ func FuzzPrefixRoundTrip(f *testing.F) {
 			t.Fatalf("POST /api/prefixes %s = 200 %s, want it refused", clip(body), clip(resp))
 		}
 		notQueued(t, fx)
-		if saved := decode[[]store.Prefix](t, resp); len(saved) != 1 || saved[0] != want {
+		if saved := decode[[]store.Prefix](t, resp); len(saved) != 1 || valP(saved[0]) != want {
 			t.Fatalf("POST /api/prefixes answered %+v, want %+v", saved, want)
 		}
 		for i, st := range sts {
-			if ps, err := st.ListPrefixes(); err != nil || !slices.Contains(ps, want) {
+			if ps, err := st.ListPrefixes(); err != nil || !slices.Contains(valsP(ps), want) {
 				t.Fatalf("%s lists %+v (%v), want %+v among them", side(i), ps, err, want)
 			}
 		}
-		if ps := get[[]store.Prefix](t, fx, "/api/prefixes"); !slices.Contains(ps, want) {
+		if ps := get[[]store.Prefix](t, fx, "/api/prefixes"); !slices.Contains(valsP(ps), want) {
 			t.Fatalf("GET /api/prefixes = %+v, want %+v among them", ps, want)
 		}
 
@@ -490,14 +490,14 @@ func FuzzPrefixRoundTrip(f *testing.F) {
 		}
 		for _, esc := range escapes {
 			seg := esc.fn(clean)
-			if one := get[store.Ticket](t, fx, "/api/tickets/"+seg+"/1"); one != tk {
+			if one := get[store.Ticket](t, fx, "/api/tickets/"+seg+"/1"); valT(one) != tk {
 				t.Fatalf("the ticket under %q escaped by %s is %+v, want %+v", clean, esc.name, one, tk)
 			}
 			rng := get[[]store.Ticket](t, fx, "/api/tickets/"+seg+"/1/3")
-			if len(rng) != 3 || rng[0] != tk || rng[1].Prefix != clean || rng[1].TID != 2 || rng[2].Prefix != clean || rng[2].TID != 3 {
+			if len(rng) != 3 || valT(rng[0]) != tk || rng[1].Prefix != clean || rng[1].TID != 2 || rng[2].Prefix != clean || rng[2].TID != 3 {
 				t.Fatalf("the range under %q escaped by %s is %+v, want the ticket and two placeholders", clean, esc.name, rng)
 			}
-			if list := get[[]store.Ticket](t, fx, "/api/tickets/"+seg); len(list) != 1 || list[0] != tk {
+			if list := get[[]store.Ticket](t, fx, "/api/tickets/"+seg); len(list) != 1 || valT(list[0]) != tk {
 				t.Fatalf("the tickets of %q escaped by %s are %+v, want only %+v", clean, esc.name, list, tk)
 			}
 			if bs := get[[]store.Basket](t, fx, "/api/baskets/"+seg+"/1/2"); len(bs) != 2 || bs[0].Prefix != clean || bs[1].Prefix != clean {
@@ -511,7 +511,7 @@ func FuzzPrefixRoundTrip(f *testing.F) {
 		}
 
 		code, resp = fx.do("DELETE", "/api/prefixes?p="+encodeURIComponent(clean), nil, nil)
-		if code != 200 || decode[store.Prefix](t, resp) != want {
+		if code != 200 || valP(decode[store.Prefix](t, resp)) != want {
 			t.Fatalf("DELETE of %q = %d %s, want 200 with %+v", clean, code, clip(resp), want)
 		}
 		for i, st := range sts {
@@ -748,24 +748,39 @@ func decoded(s string) string {
 	return string([]rune(s))
 }
 
-// jsonID spells an id as the original's clients do: form 0 a number, 1 a
-// string, 2 a float, 3 a string padded with spaces. It returns the spelling,
-// the id a decoder reads from it, and whether the decoder takes it at all.
+// jsonID spells an id: form 0 a JSON integer, 1 a string, 2 a float, 3 a
+// string padded with spaces. It returns the spelling, the id a decoder
+// reads from it, and whether the decoder takes it at all: only an integer
+// from -(2^53-1) to 2^53-1, the whole numbers a browser holds exactly.
 func jsonID(id int64, form uint8) (spelled string, value int64, ok bool) {
 	digits := strconv.FormatInt(id, 10)
 	switch form % 4 {
 	case 1:
-		return `"` + digits + `"`, id, true
+		return `"` + digits + `"`, 0, false
 	case 2:
-		// A float holds whole numbers exactly up to 2^53. The decoder
-		// refuses larger ones, and a spelling that rounds onto 2^53 reads
-		// as the rounded number, as the original's pydantic models read it.
-		f := float64(id)
-		return digits + ".0", int64(f), math.Abs(f) <= 1<<53
+		return digits + ".0", 0, false
 	case 3:
-		return `" ` + digits + ` "`, id, true
+		return `" ` + digits + ` "`, 0, false
 	}
-	return digits, id, true
+	return digits, id, id >= -(1<<53-1) && id <= 1<<53-1
+}
+
+// valT, valB, valD and valP are a row without the order numbers the server
+// stamps on it (see store.Event), and valsT, valsB and valsP a list of
+// them: the fuzz targets compare the values a save leaves.
+func valT(t store.Ticket) store.Ticket           { t.Rev = 0; return t }
+func valB(b store.Basket) store.Basket           { b.Rev, b.WinRev = 0, 0; return b }
+func valD(d store.DrawingLine) store.DrawingLine { d.WinRev = 0; return d }
+func valP(p store.Prefix) store.Prefix           { p.Rev = 0; return p }
+func valsT(ts []store.Ticket) []store.Ticket     { return mapRows(ts, valT) }
+func valsB(bs []store.Basket) []store.Basket     { return mapRows(bs, valB) }
+func valsP(ps []store.Prefix) []store.Prefix     { return mapRows(ps, valP) }
+func mapRows[T any](rows []T, f func(T) T) []T {
+	out := make([]T, len(rows))
+	for i, r := range rows {
+		out[i] = f(r)
+	}
+	return out
 }
 
 // lengthen repeats s until it is at least n bytes long, so the fuzzer

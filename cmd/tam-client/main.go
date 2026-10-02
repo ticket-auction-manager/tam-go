@@ -1,7 +1,7 @@
 // Command tam-client serves the Ticket Auction Manager web app and its API
 // on a computer at the venue, against a local database or a remote tam-server.
 //
-//go:generate go-winres simply --icon icon.ico --manifest cli --arch amd64 --product-name "Ticket Auction Manager" --file-description "Ticket Auction Manager client" --original-filename tam-client.exe --file-version 0.0.1 --product-version 0.0.1 --copyright "Copyright (c) 2026 Dilan Gilluly. MIT License." --out rsrc
+//go:generate go-winres make --in winres/winres.json --arch amd64,arm64 --out rsrc
 package main
 
 import (
@@ -78,9 +78,11 @@ func main() {
 		srv      *http.Server
 		stopOnce sync.Once
 	)
+	shutdownDone := make(chan struct{})
 	stop := func() {
 		stopOnce.Do(func() {
 			go func() {
+				defer close(shutdownDone)
 				// Let the "shutting down" answer reach the page first.
 				time.Sleep(300 * time.Millisecond)
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -142,6 +144,10 @@ func main() {
 	} else {
 		<-done
 	}
+	// Serve returns when Shutdown closes the listener, before active saves
+	// finish. Keep the database and syncer alive through the bounded drain.
+	stop()
+	<-shutdownDone
 	stopSync()
 	select {
 	case <-syncStopped:

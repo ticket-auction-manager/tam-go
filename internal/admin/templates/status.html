@@ -1,4 +1,5 @@
 {{define "title"}}Status{{end}}
+{{define "head"}}<meta http-equiv="refresh" content="5">{{end}}
 {{define "content"}}
 <h1>Status</h1>
 {{with .Data}}
@@ -14,12 +15,13 @@
   <tr><th>Baskets</th><td>{{.Baskets}}</td></tr>
 </table>
 <h2>Clients</h2>
-{{if .Keys}}
+{{if .Clients}}
 <table>
-  <tr><th>Client</th><th>Last seen</th></tr>
-  {{range .Keys}}<tr><td>{{.Description}}</td><td>{{.LastSeen}}</td></tr>
+  <tr><th>Client</th><th>Program</th><th>State</th><th>Last seen</th><th>Last update</th><th>Queued</th></tr>
+  {{range .Clients}}<tr><td>{{.Name}}</td><td>{{or .Program "–"}}</td><td>{{.State}}</td><td>{{.LastSeen}}</td><td>{{.LastUpdate}}</td><td>{{if .Queued}}{{.Queued}}{{else}}–{{end}}</td></tr>
   {{end}}
 </table>
+<p class="note">Connected means seen in the last 15 seconds. Queued is how many saves the client still has to deliver, as its last heartbeat reported. This page reloads every 5 seconds.</p>
 {{else}}
 <p>No client has paired yet. Pair one from its Settings page, or <a href="/admin/keys">create a key</a> here.</p>
 {{end}}

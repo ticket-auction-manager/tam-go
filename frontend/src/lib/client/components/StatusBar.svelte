@@ -5,8 +5,7 @@
 	// Where the TAM client program stands, from GET /api/status: whether it
 	// answers at all, its connection to the server in remote mode, and a
 	// settings file it could not read (in any mode). Nothing is shown in
-	// standalone mode while all is well, nor when the client does not have
-	// the route yet (an older client answers 404). The bar is never printed.
+	// standalone mode while all is well. The bar is never printed.
 	let status = $state(null);
 	// The program did not answer: it was shut down or crashed.
 	let unreachable = $state(false);
@@ -21,8 +20,6 @@
 			if (stopped) return;
 			unreachable = code === 0;
 			status = code === 200 && data ? data : null;
-			// An older client has no status route: no point asking again this page load.
-			if (code === 404) return;
 			timer = setTimeout(poll, POLL_MS);
 		};
 		poll();

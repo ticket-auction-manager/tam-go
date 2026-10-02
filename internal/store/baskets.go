@@ -2,21 +2,22 @@ package store
 
 import "database/sql"
 
-const basketCols = `prefix, b_id, description, donors, winning_ticket`
+const basketCols = `prefix, b_id, description, donors, winning_ticket, rev, win_rev`
 
-// upsertBasketSQL is what the baskets form saves: it never touches the
-// winning ticket of an existing basket.
-const upsertBasketSQL = `INSERT INTO baskets (prefix, b_id, description, donors, winning_ticket) VALUES (?, ?, ?, ?, ?)
-	ON CONFLICT (prefix, b_id) DO UPDATE SET description = EXCLUDED.description, donors = EXCLUDED.donors`
-
-// upsertWinningSQL is what the drawing form saves: only the winning ticket.
-const upsertWinningSQL = `INSERT INTO baskets (prefix, b_id, winning_ticket) VALUES (?, ?, ?)
-	ON CONFLICT (prefix, b_id) DO UPDATE SET winning_ticket = EXCLUDED.winning_ticket`
-
-// restoreBasketSQL overwrites every field; used by Import.
-const restoreBasketSQL = `INSERT INTO baskets (prefix, b_id, description, donors, winning_ticket) VALUES (?, ?, ?, ?, ?)
+// upsertBasketSQL writes a whole basket with its order numbers.
+const upsertBasketSQL = `INSERT INTO baskets (prefix, b_id, description, donors, winning_ticket, rev, win_rev) VALUES (?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT (prefix, b_id) DO UPDATE SET description = EXCLUDED.description, donors = EXCLUDED.donors,
-	winning_ticket = EXCLUDED.winning_ticket`
+	winning_ticket = EXCLUDED.winning_ticket, rev = EXCLUDED.rev, win_rev = EXCLUDED.win_rev`
+
+// basketArgs are the arguments of upsertBasketSQL.
+func basketArgs(b Basket) []any {
+	return []any{b.Prefix, b.BID, b.Description, b.Donors, b.WinningTicket, b.Rev, b.WinRev}
+}
+
+// upsertWinningSQL writes a winning ticket with its order number, creating
+// the basket when it does not exist yet.
+const upsertWinningSQL = `INSERT INTO baskets (prefix, b_id, winning_ticket, win_rev) VALUES (?, ?, ?, ?)
+	ON CONFLICT (prefix, b_id) DO UPDATE SET winning_ticket = EXCLUDED.winning_ticket, win_rev = EXCLUDED.win_rev`
 
 func (s *Store) queryBaskets(query string, args ...any) ([]Basket, error) {
 	rows, err := s.db.Query(query, args...)
@@ -29,7 +30,7 @@ func (s *Store) queryBaskets(query string, args ...any) ([]Basket, error) {
 		var b Basket
 		var id, winning sql.NullInt64
 		var desc, donors sql.NullString
-		if err := rows.Scan(&b.Prefix, &id, &desc, &donors, &winning); err != nil {
+		if err := rows.Scan(&b.Prefix, &id, &desc, &donors, &winning, &b.Rev, &b.WinRev); err != nil {
 			return nil, err
 		}
 		b.BID, b.WinningTicket = nint(id), nint(winning)
@@ -63,30 +64,41 @@ func (s *Store) BasketRange(prefix string, from, to int) ([]Basket, error) {
 	return s.queryBaskets(`SELECT `+basketCols+` FROM baskets WHERE prefix = ? AND b_id BETWEEN ? AND ? ORDER BY b_id`, prefix, from, to)
 }
 
-// UpsertBaskets inserts baskets or updates their description and donors.
+// UpsertBaskets writes whole baskets, with their order numbers, in one
+// transaction: what the server answered, into a client's copy.
 func (s *Store) UpsertBaskets(bs []Basket) error {
 	return s.tx(func(tx *sql.Tx) error {
-		return execEach(tx, upsertBasketSQL, len(bs), func(i int) []any {
-			b := bs[i]
-			return []any{b.Prefix, b.BID, b.Description, b.Donors, b.WinningTicket}
-		})
+		return execEach(tx, upsertBasketSQL, len(bs), func(i int) []any { return basketArgs(bs[i]) })
 	})
 }
 
-// UpsertWinning sets the winning ticket of each basket, creating the basket
-// when it does not exist yet.
+// UpsertBasketDescriptions writes the description and donors of baskets,
+// with their order number, and whole baskets that do not exist yet: what
+// the server answered for the Baskets form, into a client's copy, leaving a
+// winning ticket the copy holds alone.
+func (s *Store) UpsertBasketDescriptions(bs []Basket) error {
+	return s.tx(func(tx *sql.Tx) error {
+		return execEach(tx, `INSERT INTO baskets (prefix, b_id, description, donors, winning_ticket, rev, win_rev) VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (prefix, b_id) DO UPDATE SET description = EXCLUDED.description, donors = EXCLUDED.donors, rev = EXCLUDED.rev`,
+			len(bs), func(i int) []any { return basketArgs(bs[i]) })
+	})
+}
+
+// UpsertWinning writes the winning ticket of each basket, with its order
+// number, creating the basket when it does not exist yet: what the server
+// answered for the drawing, into a client's copy.
 func (s *Store) UpsertWinning(bs []Basket) error {
 	return s.tx(func(tx *sql.Tx) error {
 		return execEach(tx, upsertWinningSQL, len(bs), func(i int) []any {
 			b := bs[i]
-			return []any{b.Prefix, b.BID, b.WinningTicket}
+			return []any{b.Prefix, b.BID, b.WinningTicket, b.WinRev}
 		})
 	})
 }
 
 // --- drawing view ---
 
-const drawingCols = `prefix, b_id, description, winning_ticket, last_name, first_name, phone_number`
+const drawingCols = `prefix, b_id, description, winning_ticket, last_name, first_name, phone_number, win_rev`
 
 func (s *Store) queryDrawing(query string, args ...any) ([]DrawingLine, error) {
 	rows, err := s.db.Query(query, args...)
@@ -99,7 +111,7 @@ func (s *Store) queryDrawing(query string, args ...any) ([]DrawingLine, error) {
 		var d DrawingLine
 		var id, winning sql.NullInt64
 		var desc, last, first, phone sql.NullString
-		if err := rows.Scan(&d.Prefix, &id, &desc, &winning, &last, &first, &phone); err != nil {
+		if err := rows.Scan(&d.Prefix, &id, &desc, &winning, &last, &first, &phone, &d.WinRev); err != nil {
 			return nil, err
 		}
 		d.BID, d.WinningTicket = nint(id), nint(winning)

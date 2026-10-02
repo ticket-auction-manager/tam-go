@@ -1,7 +1,7 @@
 // Command tam-server is the shared Ticket Auction Manager database that
 // several tam-client installations talk to in remote mode.
 //
-//go:generate go-winres simply --icon icon.ico --manifest cli --arch amd64 --product-name "Ticket Auction Manager" --file-description "Ticket Auction Manager server" --original-filename tam-server.exe --file-version 0.0.1 --product-version 0.0.1 --copyright "Copyright (c) 2026 Dilan Gilluly. MIT License." --out rsrc
+//go:generate go-winres make --in winres/winres.json --arch amd64,arm64 --out rsrc
 package main
 
 import (
@@ -24,9 +24,11 @@ import (
 	"ticket-auction-manager/tam-go/internal/discovery"
 	"ticket-auction-manager/tam-go/internal/env"
 	"ticket-auction-manager/tam-go/internal/guard"
+	"ticket-auction-manager/tam-go/internal/presence"
 	"ticket-auction-manager/tam-go/internal/server"
 	"ticket-auction-manager/tam-go/internal/store"
 	"ticket-auction-manager/tam-go/internal/tlscert"
+	"ticket-auction-manager/tam-go/internal/version"
 )
 
 //go:embed icon.ico
@@ -134,9 +136,11 @@ func main() {
 		srv      *http.Server
 		stopOnce sync.Once
 	)
+	shutdownDone := make(chan struct{})
 	stop := func() {
 		stopOnce.Do(func() {
 			go func() {
+				defer close(shutdownDone)
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 				defer cancel()
 				srv.Shutdown(ctx)
@@ -148,15 +152,17 @@ func main() {
 		absDataDir = dataDir
 	}
 	st := store.New(sqldb)
+	// The API records what every client does; the admin page shows it.
+	clients := presence.New(nil)
 	// One limit on wrong passwords per address covers the admin login and
 	// the API's key routes, so guesses cannot be split between the two.
 	guesses := guard.New()
 	mux := http.NewServeMux()
-	adminPages := admin.NewHandler(st, password, admin.Info{Addr: *addr, Addresses: reachable, TLS: *useTLS, DataDir: absDataDir, Version: server.Version, Started: time.Now()}, admin.WithGuesses(guesses))
+	adminPages := admin.NewHandler(st, password, admin.Info{Addr: *addr, Addresses: reachable, TLS: *useTLS, DataDir: absDataDir, Version: version.Version, Started: time.Now(), Presence: clients}, admin.WithGuesses(guesses))
 	mux.Handle("/admin", adminPages)
 	mux.Handle("/admin/", adminPages)
 	mux.Handle("/favicon.ico", adminPages)
-	mux.Handle("/", server.NewHandler(st, password, server.WithGuesses(guesses)))
+	mux.Handle("/", server.NewHandler(st, password, server.WithPresence(clients), server.WithGuesses(guesses)))
 	srv = &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -199,7 +205,7 @@ func main() {
 		if name == "" {
 			name = "TAM Server"
 		}
-		if err := discovery.Announce(announceCtx, name, ln.Addr().(*net.TCPAddr).Port, *useTLS, server.Version); err != nil {
+		if err := discovery.Announce(announceCtx, name, ln.Addr().(*net.TCPAddr).Port, *useTLS, version.Version); err != nil {
 			log.Printf("not announcing on the network (%v); clients can still type the address", err)
 		} else {
 			log.Printf("announcing as %q on the local network", name)
@@ -232,6 +238,10 @@ func main() {
 	} else {
 		<-done
 	}
+	// Serve returns when Shutdown closes the listener, before active saves
+	// finish. Keep the database open until the bounded drain has completed.
+	stop()
+	<-shutdownDone
 	if serveErr != nil {
 		log.Fatal(serveErr)
 	}

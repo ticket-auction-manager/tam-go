@@ -28,9 +28,16 @@ const outboxCols = `id, created_at, method, path, body, attempts, last_error, cl
 // into that transaction. order is the save's name and number, kept for the
 // replay.
 func (s *Store) SaveQueued(method, path string, body []byte, order Order, write func(*Store) error) (int64, error) {
+	return s.SaveQueuedAs(method, path, order, func(st *Store) ([]byte, error) { return body, write(st) })
+}
+
+// SaveQueuedAs is SaveQueued for a save whose request depends on what the
+// write did: write returns the body to queue.
+func (s *Store) SaveQueuedAs(method, path string, order Order, write func(*Store) ([]byte, error)) (int64, error) {
 	var id int64
 	err := s.tx(func(tx *sql.Tx) error {
-		if err := write(&Store{db: s.db, in: tx}); err != nil {
+		body, err := write(&Store{db: s.db, in: tx})
+		if err != nil {
 			return err
 		}
 		res, err := tx.Exec(`INSERT INTO outbox (created_at, method, path, body, client, save_number) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -115,6 +122,31 @@ func (s *Store) FailOutbox(id int64, errText string) error {
 			SELECT id, created_at, method, path, body, attempts + 1, ?, ?, client, save_number FROM outbox WHERE id = ?`,
 			errText, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
 			return err
+		}
+		_, err := tx.Exec(`DELETE FROM outbox WHERE id = ?`, id)
+		return err
+	})
+}
+
+// FinishOutbox takes a request the server answered off the queue, in one
+// transaction with writing the server's rows into this client's copy
+// (write, may be nil) and, when the server did not make some of its
+// changes, keeping those changes in the failed list as a save of their own
+// (again, the body of that save, with errText as the reason) for the
+// volunteer to retry deliberately or discard.
+func (s *Store) FinishOutbox(id int64, write func(*Store) error, again []byte, errText string) error {
+	return s.tx(func(tx *sql.Tx) error {
+		if write != nil {
+			if err := write(&Store{db: s.db, in: tx}); err != nil {
+				return err
+			}
+		}
+		if again != nil {
+			if _, err := tx.Exec(`INSERT INTO outbox_failed (id, created_at, method, path, body, attempts, last_error, failed_at, client, save_number)
+				SELECT id, created_at, method, path, ?, attempts + 1, ?, ?, '', 0 FROM outbox WHERE id = ?`,
+				again, errText, time.Now().UTC().Format(time.RFC3339Nano), id); err != nil {
+				return err
+			}
 		}
 		_, err := tx.Exec(`DELETE FROM outbox WHERE id = ?`, id)
 		return err

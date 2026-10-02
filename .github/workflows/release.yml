@@ -1,0 +1,83 @@
+name: release
+
+# A pushed version tag (1.2.3, v1.2.3, 1.2.3-rc1, 1.2.3rc1) runs the tests,
+# builds every package with build.sh and attaches them, with a SHA256SUMS
+# file, to a GitHub release of that tag; a tag with a hyphen, or letters
+# after its numbers, is marked as a pre-release. The version in the file names and the programs is the tag
+# without a leading v.
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+      - "[0-9]*"
+
+permissions:
+  contents: write
+
+# Every step runs in bash with -o pipefail, so a failing command in a pipe
+# fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build the web app
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # A tag whose tests fail publishes nothing.
+      - name: Test
+        run: go test -count=1 ./...
+
+      - name: Build the archives and packages for every system
+        run: SKIP_WEB=1 VERSION="$GITHUB_REF_NAME" ./build.sh release
+
+      - name: Checksums of the release files
+        working-directory: build
+        run: |
+          # GitHub shows the ~ of a pre-release package's name as a dot
+          # (1.0.0~rc1 becomes 1.0.0.rc1), so the list names the files that way.
+          sha256sum -- tam-server-*.exe tam-client-*.exe tam-server-*.zip tam-client-*.zip \
+            tam-server-*.tar.gz tam-client-*.tar.gz *.deb *.rpm | sed 's/~/./g' > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create the GitHub release with the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pre=""
+          case "$GITHUB_REF_NAME" in *-* | *[0-9][a-z]*) pre="--prerelease" ;; esac
+          version="$GITHUB_REF_NAME"
+          case "$version" in v[0-9]*.[0-9]*) version="${version#v}" ;; esac
+          # The description: docs/release-notes.md with the version (as in the
+          # file names), the tag and the repository filled in, then the list of
+          # changes GitHub generates.
+          sed -e "s#{VERSION}#$version#g" -e "s#{TAG}#$GITHUB_REF_NAME#g" -e "s#{REPO}#$GITHUB_REPOSITORY#g" \
+            docs/release-notes.md > build/release-notes.md
+          printf '\n## Changes\n\n' >> build/release-notes.md
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$GITHUB_REF_NAME" --jq .body >> build/release-notes.md
+          gh release create "$GITHUB_REF_NAME" $pre --title "Ticket Auction Manager $version" --notes-file build/release-notes.md \
+            build/tam-server-*.exe build/tam-client-*.exe \
+            build/tam-server-*.zip build/tam-server-*.tar.gz build/tam-client-*.zip build/tam-client-*.tar.gz \
+            build/*.deb build/*.rpm build/SHA256SUMS

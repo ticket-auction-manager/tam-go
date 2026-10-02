@@ -10,13 +10,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"ticket-auction-manager/tam-go/internal/db"
 	"ticket-auction-manager/tam-go/internal/httpx"
+	"ticket-auction-manager/tam-go/internal/presence"
 	"ticket-auction-manager/tam-go/internal/store"
+	"ticket-auction-manager/tam-go/internal/version"
 )
 
 type api struct {
@@ -25,6 +28,7 @@ type api struct {
 	st    *store.Store
 	sqldb *sql.DB
 	key   string
+	saves int64 // the number of the last save do numbered
 }
 
 func newAPI(t *testing.T, opts ...Option) *api {
@@ -79,9 +83,19 @@ func (l resetOnClose) Accept() (net.Conn, error) {
 }
 
 // do sends a request. body may be nil, a string (sent verbatim as JSON) or
-// any value (marshalled).
+// any value (marshalled). A keyed POST or DELETE without X-TAM-Save is
+// numbered as the next save of client "test", as tam-client numbers its
+// saves.
 func (a *api) do(method, path string, body any, headers map[string]string) (int, []byte) {
 	a.t.Helper()
+	if (method == "POST" || method == "DELETE") && headers["TAM-KEY"] != "" && headers["X-TAM-Save"] == "" {
+		a.saves++
+		numbered := map[string]string{"X-TAM-Client-Name": "test", "X-TAM-Save": strconv.FormatInt(a.saves, 10)}
+		for k, v := range headers {
+			numbered[k] = v
+		}
+		headers = numbered
+	}
 	var rdr io.Reader
 	if body != nil {
 		switch b := body.(type) {
@@ -212,11 +226,15 @@ func TestRootReportsNameAndVersion(t *testing.T) {
 	_, body := a.do("GET", "/api", nil, nil)
 	root := decode[map[string]any](t, body)
 	hostname, _ := os.Hostname()
-	if root["name"] != hostname || root["version"] != Version || root["whoami"] != "TAM Server" || root["healthy"] != true || root["authenticated"] != false {
+	if root["name"] != hostname || root["version"] != version.Version || root["whoami"] != "TAM Server" || root["healthy"] != true || root["authenticated"] != false {
 		t.Fatalf("root = %v", root)
 	}
-	if len(root) != 5 {
-		t.Fatalf("root has %d fields, want whoami, authenticated, healthy, name and version: %v", len(root), root)
+	ev, err := a.st.Event()
+	if err != nil || ev == nil || root["event"] != ev.Event || len(ev.Event) != 32 {
+		t.Fatalf("root names event %v, the server holds %+v (%v)", root["event"], ev, err)
+	}
+	if len(root) != 6 {
+		t.Fatalf("root has %d fields, want whoami, authenticated, healthy, name, version and event: %v", len(root), root)
 	}
 
 	named := newAPI(t, WithInfo(Info{Name: "front-desk", Version: "9.9.9"}))
@@ -364,13 +382,16 @@ func TestPrefixes(t *testing.T) {
 		t.Fatalf("delete without p: %d, want 400", code)
 	}
 
-	// The original accepted numeric strings and integral floats.
-	if code, _ = a.keyed("POST", "/api/prefixes", `[{"prefix":"S","color":"red","weight":"3"},{"prefix":"F","color":"red","weight":4.0}]`); code != 200 {
-		t.Fatalf("numeric string weight: %d", code)
+	// A weight is a JSON integer; a string or a fraction is refused and
+	// nothing of the batch is written.
+	for _, body := range []string{`[{"prefix":"S","color":"red","weight":"3"}]`, `[{"prefix":"S","color":"red","weight":3},{"prefix":"F","color":"red","weight":4.5}]`} {
+		if code, _ = a.keyed("POST", "/api/prefixes", body); code != 400 {
+			t.Fatalf("POST %s = %d, want 400", body, code)
+		}
 	}
 	_, body = a.keyed("GET", "/api/prefixes", nil)
-	if ps = decode[[]store.Prefix](t, body); len(ps) != 3 {
-		t.Fatalf("after numeric string post: %v", ps)
+	if ps = decode[[]store.Prefix](t, body); len(ps) != 1 {
+		t.Fatalf("after refused posts: %v", ps)
 	}
 	// A JSON null body is an empty list, never a null answer.
 	if code, body = a.keyed("POST", "/api/prefixes", `null`); code != 200 || strings.TrimSpace(string(body)) != "[]" {
@@ -392,8 +413,8 @@ func TestErrorsAreJSON(t *testing.T) {
 	if code, body := a.keyed("POST", "/api/tickets", `[{"prefix":"A","first_name":"no id"}]`); code != 400 || !strings.Contains(string(body), "t_id is required") {
 		t.Fatalf("missing t_id = %d %s", code, body)
 	}
-	if code, _ := a.keyed("POST", "/api/tickets", `[{"prefix":"A","t_id":"12","pref":"CALL"}]`); code != 200 {
-		t.Fatalf("string t_id from the original client = %d, want 200", code)
+	if code, _ := a.keyed("POST", "/api/tickets", `[{"prefix":"A","t_id":"12","pref":"CALL"}]`); code != 400 {
+		t.Fatalf("a t_id sent as a string = %d, want 400", code)
 	}
 }
 
@@ -594,17 +615,198 @@ func TestOversizedBodyIs413(t *testing.T) {
 // TestKeyAcceptedUnderTheOriginalClientsSpelling: the original client sends
 // the key as TAM_KEY on its server-backup download, so that spelling counts
 // too, on the data routes and on the root route's authenticated flag.
-func TestKeyAcceptedUnderTheOriginalClientsSpelling(t *testing.T) {
+func TestRootReportsTheBuildVersion(t *testing.T) {
+	old := version.Version
+	version.Version = "9.9.9-test"
+	t.Cleanup(func() { version.Version = old })
 	a := newAPI(t)
-	underscore := map[string]string{"TAM_KEY": a.key}
-	if code, body := a.do("GET", "/api/backuprestore", nil, underscore); code != 200 {
-		t.Fatalf("backup with TAM_KEY = %d %s", code, body)
+	_, body := a.do("GET", "/api", nil, nil)
+	if root := decode[map[string]any](t, body); root["version"] != "9.9.9-test" {
+		t.Fatalf("root = %s, want the stamped version", body)
 	}
-	_, body := a.do("GET", "/api", nil, underscore)
-	if root := decode[map[string]any](t, body); root["authenticated"] != true {
-		t.Fatalf("root with TAM_KEY = %s", body)
+}
+
+// TestPresenceFollowsKeyedRequests: every request with a valid key is a
+// sighting of that client, named by X-TAM-Client or else by its
+// User-Agent; an accepted POST or DELETE is also an update.
+func TestPresenceFollowsKeyedRequests(t *testing.T) {
+	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+	reg := presence.New(func() time.Time { return now })
+	a := newAPI(t, WithPresence(reg))
+	if snap := reg.Snapshot(); len(snap) != 0 {
+		t.Fatalf("nothing has happened yet: %v", snap)
 	}
-	if code, _ := a.do("GET", "/api/backuprestore", nil, map[string]string{"TAM_KEY": "WRONG"}); code != 401 {
-		t.Fatalf("a wrong TAM_KEY must still be refused, got %d", code)
+
+	a.do("GET", "/api/prefixes", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Client": "tam-client/1.2.3"})
+	rec := reg.Snapshot()[a.key]
+	if rec.Seen != now || rec.Client != "tam-client/1.2.3" || rec.HasPending || !rec.Updated.IsZero() {
+		t.Fatalf("after a keyed read: %+v", rec)
+	}
+
+	// A wrong key is nobody.
+	a.do("GET", "/api/prefixes", nil, map[string]string{"TAM-KEY": "WRONG", "X-TAM-Client": "tam-client/1.2.3"})
+	if snap := reg.Snapshot(); len(snap) != 1 {
+		t.Fatalf("a rejected key must not be recorded: %v", snap)
+	}
+
+	// An accepted write is an update; a refused one is only a sighting.
+	now = now.Add(time.Second)
+	if code, _ := a.keyed("POST", "/api/tickets", `[{"prefix":"A","t_id":1,"pref":"CALL"}]`); code != 200 {
+		t.Fatalf("post = %d", code)
+	}
+	updated := now
+	if rec = reg.Snapshot()[a.key]; rec.Updated != updated || rec.Seen != now {
+		t.Fatalf("after an accepted write: %+v", rec)
+	}
+	now = now.Add(time.Second)
+	if code, _ := a.keyed("POST", "/api/tickets", `[{"prefix":"","t_id":1}]`); code != 400 {
+		t.Fatalf("invalid post = %d", code)
+	}
+	if rec = reg.Snapshot()[a.key]; rec.Updated != updated || rec.Seen != now {
+		t.Fatalf("after a refused write: %+v, want seen now and updated unchanged", rec)
+	}
+	now = now.Add(time.Second)
+	if code, _ := a.keyed("DELETE", "/api/prefixes?p=NOPE", nil); code != 404 {
+		t.Fatalf("delete of a missing prefix = %d", code)
+	}
+	if rec = reg.Snapshot()[a.key]; rec.Updated != updated || rec.Seen != now {
+		t.Fatalf("after a delete that found nothing: %+v, want seen now and updated unchanged", rec)
+	}
+	a.keyed("POST", "/api/prefixes", `[{"prefix":"A","color":"red","weight":1}]`)
+	now = now.Add(time.Second)
+	if code, _ := a.keyed("DELETE", "/api/prefixes?p=A", nil); code != 200 {
+		t.Fatalf("delete = %d", code)
+	}
+	if rec = reg.Snapshot()[a.key]; rec.Updated != now {
+		t.Fatalf("after an accepted delete: %+v, want updated now", rec)
+	}
+
+	// Without X-TAM-Client the program is the User-Agent's first word, and
+	// "unknown" without that either. Plain requests never invent a count.
+	a.do("GET", "/api/tickets", nil, map[string]string{"TAM-KEY": a.key, "User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+	if rec = reg.Snapshot()[a.key]; rec.Client != "Mozilla/5.0" {
+		t.Fatalf("client from the User-Agent = %q, want Mozilla/5.0", rec.Client)
+	}
+	a.do("GET", "/api/tickets", nil, map[string]string{"TAM-KEY": a.key, "User-Agent": ""})
+	if rec = reg.Snapshot()[a.key]; rec.Client != "unknown" {
+		t.Fatalf("client without any header = %q, want unknown", rec.Client)
+	}
+	long := strings.Repeat("x", 200)
+	a.do("GET", "/api/tickets", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Client": long})
+	if rec = reg.Snapshot()[a.key]; len(rec.Client) != maxClientLen || !strings.HasPrefix(long, rec.Client) {
+		t.Fatalf("an over-long client name must be cut to %d characters, got %d", maxClientLen, len(rec.Client))
+	}
+	if rec.HasPending {
+		t.Fatalf("plain requests must not invent a heartbeat count: %+v", rec)
+	}
+}
+
+// TestHeartbeatRecordsTheQueuedSaves: GET /api with the key is the
+// heartbeat, and X-TAM-Pending on it is how many saves wait on the client.
+func TestHeartbeatRecordsTheQueuedSaves(t *testing.T) {
+	now := time.Date(2026, 9, 26, 10, 0, 0, 0, time.UTC)
+	reg := presence.New(func() time.Time { return now })
+	a := newAPI(t, WithPresence(reg))
+
+	a.do("GET", "/api", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Client": "tam-client/1.2.3", "X-TAM-Pending": "2"})
+	rec := reg.Snapshot()[a.key]
+	if rec.Seen != now || !rec.HasPending || rec.Pending != 2 || rec.Client != "tam-client/1.2.3" || !rec.Updated.IsZero() {
+		t.Fatalf("after a heartbeat with two queued: %+v", rec)
+	}
+	now = now.Add(5 * time.Second)
+	a.do("GET", "/api/", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Client": "tam-client/1.2.3", "X-TAM-Pending": "0"})
+	if rec = reg.Snapshot()[a.key]; rec.Seen != now || !rec.HasPending || rec.Pending != 0 {
+		t.Fatalf("after a heartbeat with nothing queued: %+v", rec)
+	}
+
+	// A count that does not parse is still a sighting; the last good count
+	// stays.
+	a.do("GET", "/api", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Pending": "1"})
+	for _, bad := range []string{"-1", "x", "1.5", ""} {
+		now = now.Add(5 * time.Second)
+		a.do("GET", "/api", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Client": "tam-client/1.2.3", "X-TAM-Pending": bad})
+		if rec = reg.Snapshot()[a.key]; rec.Seen != now || !rec.HasPending || rec.Pending != 1 {
+			t.Fatalf("after a heartbeat with X-TAM-Pending %q: %+v", bad, rec)
+		}
+	}
+
+	// The original client sends neither header: it is seen under its
+	// User-Agent and never gets a count.
+	otherReg := presence.New(func() time.Time { return now })
+	other := newAPI(t, WithPresence(otherReg))
+	other.do("GET", "/api", nil, map[string]string{"TAM-KEY": other.key})
+	if rec = otherReg.Snapshot()[other.key]; rec.Seen != now || rec.HasPending || rec.Client != "Go-http-client/1.1" {
+		t.Fatalf("a heartbeat without the headers: %+v", rec)
+	}
+
+	// No key, or a wrong one, records nothing.
+	a.do("GET", "/api", nil, map[string]string{"X-TAM-Pending": "3"})
+	a.do("GET", "/api", nil, map[string]string{"TAM-KEY": "WRONG", "X-TAM-Pending": "3"})
+	if snap := reg.Snapshot(); len(snap) != 1 {
+		t.Fatalf("the root without a valid key must not be recorded: %v", snap)
+	}
+}
+
+func TestDeletingAKeyForgetsItsPresence(t *testing.T) {
+	reg := presence.New(nil)
+	a := newAPI(t, WithPresence(reg))
+	_, body := a.pw("POST", "/api/auth", map[string]string{"description": "client"})
+	k := decode[store.AuthKey](t, body)
+	a.do("GET", "/api", nil, map[string]string{"TAM-KEY": k.AuthKey, "X-TAM-Pending": "1"})
+	a.do("GET", "/api", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Pending": "1"})
+	if _, ok := reg.Snapshot()[k.AuthKey]; !ok {
+		t.Fatal("the new key must be seen")
+	}
+	if code, _ := a.pw("DELETE", "/api/auth?key_to_del="+k.AuthKey, nil); code != 200 {
+		t.Fatalf("delete = %d", code)
+	}
+	snap := reg.Snapshot()
+	if _, ok := snap[k.AuthKey]; ok || len(snap) != 1 {
+		t.Fatalf("a deleted key must be forgotten and the others kept: %v", snap)
+	}
+}
+
+// TestAcceptedWritesPersistLastUpdateOncePerInterval: last_update is
+// written like last_seen, throttled, and only by writes the server took.
+func TestAcceptedWritesPersistLastUpdateOncePerInterval(t *testing.T) {
+	a := newAPI(t)
+	lastUpdate := func() string {
+		t.Helper()
+		ks, err := a.st.ListKeys()
+		if err != nil || len(ks) != 1 {
+			t.Fatalf("ListKeys = %v %v", ks, err)
+		}
+		return ks[0].LastUpdate
+	}
+	a.keyed("GET", "/api/prefixes", nil)
+	a.do("GET", "/api", nil, map[string]string{"TAM-KEY": a.key, "X-TAM-Pending": "0"})
+	if lastUpdate() != "" {
+		t.Fatalf("reads and heartbeats must not set last_update, got %q", lastUpdate())
+	}
+	if code, _ := a.keyed("POST", "/api/tickets", `[{"prefix":"","t_id":1}]`); code != 400 || lastUpdate() != "" {
+		t.Fatalf("a refused write must not set last_update: %d %q", code, lastUpdate())
+	}
+
+	a.keyed("POST", "/api/tickets", `[]`)
+	if updated, err := time.Parse(time.RFC3339, lastUpdate()); err != nil || time.Since(updated) > 5*time.Second {
+		t.Fatalf("last_update after an accepted write = %q (%v)", lastUpdate(), err)
+	}
+	if _, err := a.sqldb.Exec(`UPDATE auth_key_activity SET last_update = '2000-01-01T00:00:00Z'`); err != nil {
+		t.Fatal(err)
+	}
+	a.keyed("POST", "/api/baskets", `[]`)
+	if lastUpdate() != "2000-01-01T00:00:00Z" {
+		t.Fatalf("last_update was written again within the interval: %q", lastUpdate())
+	}
+
+	old := touchEvery
+	touchEvery = 0
+	defer func() { touchEvery = old }()
+	a.keyed("POST", "/api/baskets", `[]`)
+	if updated, err := time.Parse(time.RFC3339, lastUpdate()); err != nil || time.Since(updated) > 5*time.Second {
+		t.Fatalf("last_update after the interval = %q (%v)", lastUpdate(), err)
+	}
+	if code, body := a.pw("GET", "/api/auth", nil); code != 200 || !strings.Contains(string(body), `"last_update":"`) {
+		t.Fatalf("GET /api/auth should carry last_update once a key has written: %d %s", code, body)
 	}
 }

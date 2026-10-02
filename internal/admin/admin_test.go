@@ -2,6 +2,7 @@ package admin
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,7 @@ import (
 
 	"ticket-auction-manager/tam-go/internal/db"
 	"ticket-auction-manager/tam-go/internal/guard"
+	"ticket-auction-manager/tam-go/internal/presence"
 	"ticket-auction-manager/tam-go/internal/server"
 	"ticket-auction-manager/tam-go/internal/store"
 )
@@ -27,13 +29,15 @@ import (
 // site is one admin page under test with a browser-like client: a cookie
 // jar and no automatic redirects, so every 303 can be checked.
 type site struct {
-	t   *testing.T
-	url string
-	dir string
-	st  *store.Store
-	pw  *Password
-	h   *handler
-	c   *http.Client
+	t     *testing.T
+	url   string
+	dir   string
+	sqldb *sql.DB
+	st    *store.Store
+	pw    *Password
+	h     *handler
+	reg   *presence.Registry
+	c     *http.Client
 }
 
 func newSite(t *testing.T, envPassword string, opts ...Option) *site {
@@ -55,10 +59,13 @@ func newSite(t *testing.T, envPassword string, opts ...Option) *site {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hd := NewHandler(st, pw, Info{Addr: ":8000", DataDir: dir, Version: "0.0.1", Started: time.Now().Add(-90 * time.Second)}, opts...)
+	// The registry reads the same clock as the pages, which tests move.
+	var hd http.Handler
+	reg := presence.New(func() time.Time { return hd.(*handler).ss.now() })
+	hd = NewHandler(st, pw, Info{Addr: ":8000", DataDir: dir, Version: "0.0.1", Started: time.Now().Add(-90 * time.Second), Presence: reg}, opts...)
 	ts := httptest.NewServer(hd)
 	t.Cleanup(ts.Close)
-	return &site{t: t, url: ts.URL, dir: dir, st: st, pw: pw, h: hd.(*handler), c: newBrowser(t)}
+	return &site{t: t, url: ts.URL, dir: dir, sqldb: sqldb, st: st, pw: pw, h: hd.(*handler), reg: reg, c: newBrowser(t)}
 }
 
 func newBrowser(t *testing.T) *http.Client {
@@ -785,6 +792,197 @@ func TestCookieIsSecureOverTLS(t *testing.T) {
 	res.Body.Close()
 	if c := res.Cookies(); len(c) != 1 || !c[0].Secure {
 		t.Fatalf("cookie over TLS = %+v, want Secure", c)
+	}
+}
+
+// statusDoc is what GET /admin/status answers to Accept: application/json.
+type statusDoc struct {
+	Uptime   string `json:"uptime"`
+	Prefixes int    `json:"prefixes"`
+	Tickets  int    `json:"tickets"`
+	Baskets  int    `json:"baskets"`
+	Clients  []struct {
+		Name       string `json:"name"`
+		Program    string `json:"program"`
+		State      string `json:"state"`
+		LastSeen   string `json:"last_seen"`
+		LastUpdate string `json:"last_update"`
+		Queued     *int   `json:"queued"`
+	} `json:"clients"`
+}
+
+// getJSON fetches a page with Accept: application/json.
+func (s *site) getJSON(path string) (*http.Response, string) {
+	s.t.Helper()
+	req, err := http.NewRequest("GET", s.url+path, nil)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	req.Header.Set("Accept", "application/json")
+	res, err := s.c.Do(req)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+	return res, string(body)
+}
+
+// stamp writes the persisted last_seen and last_update of a key, as an
+// earlier run of the server would have left them.
+func (s *site) stamp(key string, seen, update time.Time) {
+	s.t.Helper()
+	if _, err := s.sqldb.Exec(`INSERT INTO auth_key_activity (auth_key, last_seen, last_update) VALUES (?, ?, ?)
+		ON CONFLICT (auth_key) DO UPDATE SET last_seen = excluded.last_seen, last_update = excluded.last_update`,
+		key, seen.UTC().Format(time.RFC3339), update.UTC().Format(time.RFC3339)); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+// row is a Clients table row as the status page renders it.
+func row(cells ...string) string {
+	return "<tr><td>" + strings.Join(cells, "</td><td>") + "</td></tr>"
+}
+
+func TestStatusListsClients(t *testing.T) {
+	s := newSite(t, "secret")
+	s.login("secret")
+	base := time.Now().Truncate(time.Second) // stored stamps have whole seconds
+	s.h.ss.now = func() time.Time { return base }
+	s.h.info.Started = base.Add(-90 * time.Second) // the uptime is measured from the same clock
+	at := func(t time.Time) string { return t.Local().Format("2006-01-02 15:04") }
+	const dash = "\u2013"
+
+	// Three clients: one paired by hand and never seen, one the registry
+	// knows, and one only the database remembers from before a restart.
+	if _, err := s.st.CreateKey("Quiet <one>"); err != nil {
+		t.Fatal(err)
+	}
+	busy, err := s.st.CreateKey("Busy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := s.st.CreateKey("Stored")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.stamp(stored.AuthKey, base.Add(-40*time.Second), base.Add(-time.Hour))
+	s.reg.Heartbeat(busy.AuthKey, "tam-client/1.2.3", 0)
+
+	body, _ := s.page("/admin/status")
+	if !strings.Contains(body, `<meta http-equiv="refresh" content="5">`) {
+		t.Fatalf("the status page must reload itself:\n%s", body)
+	}
+	if !strings.Contains(body, "<h2>Clients</h2>") {
+		t.Fatalf("the table is called Clients:\n%s", body)
+	}
+	for _, want := range []string{
+		row("Busy", "tam-client/1.2.3", "connected", at(base)+" (just now)", "never", "0"),
+		row("Quiet &lt;one&gt;", dash, "never", "never", "never", dash),
+		row("Stored", dash, "away for 40 s", at(base.Add(-40*time.Second))+" (just now)", at(base.Add(-time.Hour))+" (1 h ago)", dash),
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("status page lacks the row %s:\n%s", want, body)
+		}
+	}
+
+	// An accepted write and a heartbeat with a queue show up, and the
+	// values in memory win over what the database remembers.
+	s.stamp(busy.AuthKey, base.Add(-24*time.Hour), base.Add(-24*time.Hour))
+	s.reg.Updated(busy.AuthKey)
+	s.reg.Heartbeat(busy.AuthKey, "tam-client/1.2.3", 2)
+	body, _ = s.page("/admin/status")
+	if want := row("Busy", "tam-client/1.2.3", "connected", at(base)+" (just now)", at(base)+" (just now)", "2"); !strings.Contains(body, want) {
+		t.Fatalf("status page lacks the row %s:\n%s", want, body)
+	}
+
+	// Connected means seen within 15 s; after that the client is away.
+	s.h.ss.now = func() time.Time { return base.Add(15 * time.Second) }
+	if body, _ = s.page("/admin/status"); !strings.Contains(body, row("Busy", "tam-client/1.2.3", "connected", at(base)+" (just now)", at(base)+" (just now)", "2")) {
+		t.Fatalf("at 15 s the client is still connected:\n%s", body)
+	}
+	s.h.ss.now = func() time.Time { return base.Add(16 * time.Second) }
+	if body, _ = s.page("/admin/status"); !strings.Contains(body, row("Busy", "tam-client/1.2.3", "away for 16 s", at(base)+" (just now)", at(base)+" (just now)", "2")) {
+		t.Fatalf("at 16 s the client is away:\n%s", body)
+	}
+	s.h.ss.now = func() time.Time { return base.Add(2*time.Minute + 3*time.Second) }
+	body, _ = s.page("/admin/status")
+	if !strings.Contains(body, row("Busy", "tam-client/1.2.3", "away for 2 min 3 s", at(base)+" (2 min ago)", at(base)+" (2 min ago)", "2")) {
+		t.Fatalf("after two minutes:\n%s", body)
+	}
+	if !strings.Contains(body, row("Stored", dash, "away for 2 min 43 s", at(base.Add(-40*time.Second))+" (2 min ago)", at(base.Add(-time.Hour))+" (1 h ago)", dash)) {
+		t.Fatalf("the stored client after two minutes:\n%s", body)
+	}
+
+	// The same as JSON, for scripts.
+	res, text := s.getJSON("/admin/status")
+	if res.StatusCode != 200 || res.Header.Get("Content-Type") != "application/json" {
+		t.Fatalf("JSON status = %d %q\n%s", res.StatusCode, res.Header.Get("Content-Type"), text)
+	}
+	var doc statusDoc
+	if err := json.Unmarshal([]byte(text), &doc); err != nil {
+		t.Fatalf("JSON status: %v\n%s", err, text)
+	}
+	if doc.Uptime != "3 min 33 s" || doc.Prefixes != 0 || len(doc.Clients) != 3 {
+		t.Fatalf("JSON status = %+v", doc)
+	}
+	b, q, st := doc.Clients[0], doc.Clients[1], doc.Clients[2]
+	if b.Name != "Busy" || b.Program != "tam-client/1.2.3" || b.State != "away for 2 min 3 s" || b.LastSeen != at(base)+" (2 min ago)" || b.LastUpdate != at(base)+" (2 min ago)" || b.Queued == nil || *b.Queued != 2 {
+		t.Fatalf("JSON row for Busy = %+v", b)
+	}
+	if q.Name != "Quiet <one>" || q.Program != "" || q.State != "never" || q.LastSeen != "never" || q.LastUpdate != "never" || q.Queued != nil {
+		t.Fatalf("JSON row for Quiet = %+v", q)
+	}
+	if st.Name != "Stored" || st.Program != "" || st.State != "away for 2 min 43 s" || st.Queued != nil {
+		t.Fatalf("JSON row for Stored = %+v", st)
+	}
+	seed(t, s.st)
+	if _, text = s.getJSON("/admin/status"); !strings.Contains(text, `"prefixes":1,"tickets":1,"baskets":1`) {
+		t.Fatalf("JSON counts:\n%s", text)
+	}
+
+	// Without a login the JSON is a 401, not a redirect to the login form.
+	fresh := &site{t: t, url: s.url, c: newBrowser(t)}
+	res, text = fresh.getJSON("/admin/status")
+	if res.StatusCode != 401 || res.Header.Get("Content-Type") != "application/json" || strings.TrimSpace(text) != `{"detail":"Not logged in"}` {
+		t.Fatalf("JSON status without a login = %d %q %s", res.StatusCode, res.Header.Get("Content-Type"), text)
+	}
+	if res, _ = fresh.get("/admin/status"); res.StatusCode != 303 {
+		t.Fatalf("HTML status without a login = %d, want the redirect", res.StatusCode)
+	}
+
+	// Only the status page reloads itself.
+	if body, _ = s.page("/admin/keys"); strings.Contains(body, `http-equiv="refresh"`) {
+		t.Fatal("the keys page must not reload itself")
+	}
+}
+
+// TestStatusWithoutARegistry: with no registry wired in, the page shows
+// what the database remembers.
+func TestStatusWithoutARegistry(t *testing.T) {
+	dir := t.TempDir()
+	sqldb, err := db.Open(filepath.Join(dir, "tam-remote.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if err := db.Migrate(sqldb); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.MigrateServer(sqldb); err != nil {
+		t.Fatal(err)
+	}
+	st := store.New(sqldb)
+	if _, err := st.CreateKey("client"); err != nil {
+		t.Fatal(err)
+	}
+	pw, _ := Load(dir, "secret")
+	ts := httptest.NewServer(NewHandler(st, pw, Info{Started: time.Now()}))
+	defer ts.Close()
+	s := &site{t: t, url: ts.URL, c: newBrowser(t)}
+	s.login("secret")
+	if body, _ := s.page("/admin/status"); !strings.Contains(body, row("client", "\u2013", "never", "never", "never", "\u2013")) {
+		t.Fatalf("status without a registry shows what the database has:\n%s", body)
 	}
 }
 

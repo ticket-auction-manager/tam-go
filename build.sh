@@ -33,13 +33,13 @@ case "$version" in
 esac
 ldflags="-s -w -X ticket-auction-manager/tam-go/internal/version.Version=${version}"
 # The Linux packages need a version deb and rpm accept: 1.2.3 gives 1.2.3,
-# 1.2.3-rc1 gives 1.2.3 with the prerelease rc1 (sorted before 1.2.3), and
-# anything else, such as the bare commit git describe gives in a clone
-# without tags, gives 0.0.0 with the whole string, letters, digits and dots
-# only, as the prerelease, so it sorts below every release.
+# 1.2.3-rc1 and 1.2.3rc1 give 1.2.3 with the prerelease rc1 (sorted before
+# 1.2.3), and anything else, such as the bare commit git describe gives in a
+# clone without tags, gives 0.0.0 with the whole string, letters, digits and
+# dots only, as the prerelease, so it sorts below every release.
 case "$version" in
   [0-9]*.[0-9]*)
-    pkg_version="${version%%-*}"
+    pkg_version="$(printf '%s' "${version%%-*}" | sed -E 's/^([0-9]+(\.[0-9]+)*).*/\1/')"
     pkg_prerelease="${version#"$pkg_version"}"
     pkg_prerelease="${pkg_prerelease#-}"
     ;;

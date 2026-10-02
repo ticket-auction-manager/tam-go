@@ -1,6 +1,6 @@
 <script>
 	import { bS, iS, rBS, tS } from '$lib/client/styles';
-	import { getJSON, saveMarked, saveOnLeave, errorMessage } from '$lib/client/api';
+	import { getJSON, saveMarked, saveOnLeave, errorMessage, startFrom, rowValues, SEARCH_FORM } from '$lib/client/api';
 	import HeaderBar from '$lib/client/components/HeaderBar.svelte';
 	import CommandBar from '$lib/client/components/CommandBar.svelte';
 	import TicketSearchBar from '$lib/client/components/TicketSearchBar.svelte';
@@ -39,7 +39,7 @@
 		async search() {
 			// Rows marked in the last results are saved first, as the forms do
 			// before they load other rows; the results would replace them.
-			const problem = await saveMarked('/api/search/tickets', itemsBuffer);
+			const problem = await saveMarked('/api/search/tickets', itemsBuffer, { form: SEARCH_FORM });
 			if (problem) {
 				alert(problem);
 				return;
@@ -52,14 +52,15 @@
 				alert(`Error searching: ${errorMessage(e)}`);
 				return;
 			}
-			items = [...resData];
+			items = startFrom(SEARCH_FORM, resData);
 			searched = true;
 			if (items.length > 0) setTimeout(() => focusIdx(0), 1);
 		},
 		// Resolves to false when the marked rows could not be saved.
 		async save(opts = {}) {
 			const problem = await saveMarked('/api/search/tickets', itemsBuffer, {
-				keepalive: !!opts.keepalive
+				keepalive: !!opts.keepalive,
+				form: SEARCH_FORM
 			});
 			// A save made as the page is hidden or closed shows nothing and leaves
 			// the cursor where it is: the volunteer may come back to the row.
@@ -94,8 +95,7 @@
 		},
 		dupDown() {
 			if (items[nextIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 't_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 't_id');
 				items[nextIdx] = { ...items[nextIdx], ...buffer, changed: true };
 				this.nextLine();
 			} else {
@@ -104,8 +104,7 @@
 		},
 		dupUp() {
 			if (curIdx > 0) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 't_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 't_id');
 				items[prevIdx] = { ...items[prevIdx], ...buffer, changed: true };
 				this.prevLine();
 			} else {
@@ -114,15 +113,14 @@
 		},
 		copy() {
 			if (items[curIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 't_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 't_id');
 				window.localStorage.setItem('tam-ticket', JSON.stringify(buffer));
 			}
 			setTimeout(() => focusIdx(curIdx), 1);
 		},
 		paste() {
 			if (items[curIdx]) {
-				const buffer = JSON.parse(window.localStorage.getItem('tam-ticket'));
+				const buffer = rowValues(JSON.parse(window.localStorage.getItem('tam-ticket')), 't_id');
 				items[curIdx] = { ...items[curIdx], ...buffer, changed: true };
 			}
 			setTimeout(() => focusIdx(curIdx), 1);

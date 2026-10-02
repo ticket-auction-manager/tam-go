@@ -34,16 +34,16 @@ func must(t *testing.T, err error) {
 
 func TestPrefixes(t *testing.T) {
 	s := newTestStore(t)
-	must(t, s.UpsertPrefixes([]Prefix{{"B", "blue", 2}, {"A", "red", 1}}))
+	must(t, s.UpsertPrefixes([]Prefix{{"B", "blue", 2, 0}, {"A", "red", 1, 0}}))
 
 	got, err := s.ListPrefixes()
 	must(t, err)
-	want := []Prefix{{"A", "red", 1}, {"B", "blue", 2}}
+	want := []Prefix{{"A", "red", 1, 0}, {"B", "blue", 2, 0}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ListPrefixes = %v, want %v", got, want)
 	}
 
-	must(t, s.UpsertPrefixes([]Prefix{{"A", "green", 1}}))
+	must(t, s.UpsertPrefixes([]Prefix{{"A", "green", 1, 0}}))
 	got, _ = s.ListPrefixes()
 	if got[0].Color != "green" {
 		t.Fatalf("upsert did not update colour: %v", got)
@@ -71,10 +71,10 @@ func TestPrefixes(t *testing.T) {
 func TestTickets(t *testing.T) {
 	s := newTestStore(t)
 	must(t, s.UpsertTickets([]Ticket{
-		{"A", 3, "Cara", "Lee", "555-0003", "TEXT"},
-		{"A", 1, "Joan", "Smith", "555-0001", "CALL"},
-		{"B", 1, "Bob", "Jones", "555-0100", "CALL"},
-		{"A", 2, "Jo", "Kim", "555-0002", "CALL"},
+		{"A", 3, "Cara", "Lee", "555-0003", "TEXT", 0},
+		{"A", 1, "Joan", "Smith", "555-0001", "CALL", 0},
+		{"B", 1, "Bob", "Jones", "555-0100", "CALL", 0},
+		{"A", 2, "Jo", "Kim", "555-0002", "CALL", 0},
 	}))
 
 	all, err := s.AllTickets()
@@ -104,7 +104,7 @@ func TestTickets(t *testing.T) {
 		t.Fatalf("TicketRange = %v", rng)
 	}
 
-	must(t, s.UpsertTickets([]Ticket{{"A", 1, "Joan", "Smith-Ng", "555-0001", "TEXT"}}))
+	must(t, s.UpsertTickets([]Ticket{{"A", 1, "Joan", "Smith-Ng", "555-0001", "TEXT", 0}}))
 	one, _ = s.Ticket("A", 1)
 	if one.LastName != "Smith-Ng" || one.Pref != "TEXT" {
 		t.Fatalf("upsert did not update: %v", one)
@@ -125,7 +125,7 @@ func TestTickets(t *testing.T) {
 	}
 
 	// LIKE wildcards typed by a user are literal characters.
-	must(t, s.UpsertTickets([]Ticket{{"C", 1, "50%", "a_b", "x", "CALL"}}))
+	must(t, s.UpsertTickets([]Ticket{{"C", 1, "50%", "a_b", "x", "CALL", 0}}))
 	if found, _ = s.SearchTickets("%", "", ""); len(found) != 1 || found[0].FirstName != "50%" {
 		t.Fatalf("search for a literal percent = %v", found)
 	}
@@ -143,7 +143,7 @@ func TestTickets(t *testing.T) {
 // ticket.
 func TestSearchComparesWholeFields(t *testing.T) {
 	s := newTestStore(t)
-	must(t, s.UpsertTickets([]Ticket{{"A", 1, "Ann\x00e", "Lee", "5", "CALL"}, {"A", 2, "Bob", "Lee", "5", "CALL"}}))
+	must(t, s.UpsertTickets([]Ticket{{"A", 1, "Ann\x00e", "Lee", "5", "CALL", 0}, {"A", 2, "Bob", "Lee", "5", "CALL", 0}}))
 	for _, fragment := range []string{"e", "\x00", "N\x00E"} {
 		found, err := s.SearchTickets(fragment, "", "")
 		if err != nil || len(found) != 1 || found[0].TID != 1 {
@@ -158,7 +158,7 @@ func TestSearchComparesWholeFields(t *testing.T) {
 func TestSearchWithALongFragment(t *testing.T) {
 	s := newTestStore(t)
 	long := strings.Repeat("x", 60000)
-	must(t, s.UpsertTickets([]Ticket{{"A", 1, long, "", "", "CALL"}, {"A", 2, "x", "", "", "CALL"}}))
+	must(t, s.UpsertTickets([]Ticket{{"A", 1, long, "", "", "CALL", 0}, {"A", 2, "x", "", "", "CALL", 0}}))
 	found, err := s.SearchTickets(long, "", "")
 	if err != nil || len(found) != 1 || found[0].TID != 1 {
 		t.Fatalf("search for 60,000 bytes = %d rows, %v; want ticket A/1 alone", len(found), err)
@@ -168,45 +168,45 @@ func TestSearchWithALongFragment(t *testing.T) {
 func TestValidation(t *testing.T) {
 	long := strings.Repeat("L", 101)
 	for _, bad := range []Prefix{
-		{"", "red", 1}, {"   ", "red", 1}, {"A/B", "red", 1}, {`A\B`, "red", 1}, {"A\tB", "red", 1},
-		{long, "red", 1}, {"A", "chartreuse", 1}, {"A", "red", -1},
+		{"", "red", 1, 0}, {"   ", "red", 1, 0}, {"A/B", "red", 1, 0}, {`A\B`, "red", 1, 0}, {"A\tB", "red", 1, 0},
+		{long, "red", 1, 0}, {"A", "chartreuse", 1, 0}, {"A", "red", -1, 0},
 	} {
 		if err := ValidatePrefixes([]Prefix{bad}); err == nil {
 			t.Errorf("ValidatePrefixes(%+v) should fail", bad)
 		}
 	}
-	ok := []Prefix{{" A ", "red", 0}}
+	ok := []Prefix{{" A ", "red", 0, 0}}
 	if err := ValidatePrefixes(ok); err != nil || ok[0].Prefix != "A" {
 		t.Fatalf("ValidatePrefixes trims: %v %+v", err, ok)
 	}
 
 	// Tickets only need a non-empty prefix, so an original database with an
 	// unusual prefix stays writable.
-	if err := ValidateTickets([]Ticket{{"A/B", 1, "", "", "", "CALL"}}); err != nil {
+	if err := ValidateTickets([]Ticket{{"A/B", 1, "", "", "", "CALL", 0}}); err != nil {
 		t.Errorf("ticket under an existing slash prefix must be accepted: %v", err)
 	}
-	if err := ValidateTickets([]Ticket{{" ", 1, "", "", "", "CALL"}}); err == nil {
+	if err := ValidateTickets([]Ticket{{" ", 1, "", "", "", "CALL", 0}}); err == nil {
 		t.Error("ticket with a blank prefix should fail")
 	}
-	if err := ValidateTickets([]Ticket{{"A", -1, "", "", "", "CALL"}}); err == nil || !strings.Contains(err.Error(), "ticket 1 (A/-1)") {
+	if err := ValidateTickets([]Ticket{{"A", -1, "", "", "", "CALL", 0}}); err == nil || !strings.Contains(err.Error(), "ticket 1 (A/-1)") {
 		t.Errorf("ticket with a negative id should fail naming the row, got %v", err)
 	}
-	anyPref := []Ticket{{"A", 1, "", "", "", " call "}}
+	anyPref := []Ticket{{"A", 1, "", "", "", " call ", 0}}
 	if err := ValidateTickets(anyPref); err != nil || anyPref[0].Pref != "call" {
 		t.Fatalf("pref is free text like the original: %v %+v", err, anyPref)
 	}
-	if err := ValidateBaskets([]Basket{{"A", 1, "", "", -1}}); err == nil {
+	if err := ValidateBaskets([]Basket{{"A", 1, "", "", -1, 0, 0}}); err == nil {
 		t.Error("basket with a negative winning ticket should fail")
 	}
 
-	bf := BackupFile{Prefixes: []Prefix{{"OLD", "gray", 1}}, Tickets: []Ticket{{"OLD", 1, "", "", "", "call"}}}
+	bf := BackupFile{Prefixes: []Prefix{{"OLD", "gray", 1, 0}}, Tickets: []Ticket{{"OLD", 1, "", "", "", "call", 0}}}
 	if err := ValidateBackup(&bf); err != nil {
 		t.Fatalf("a backup from the original app must restore: %v", err)
 	}
 	if bf.Prefixes[0].Color != "white" || bf.Baskets == nil {
 		t.Fatalf("ValidateBackup should normalise colours and nil lists: %+v", bf)
 	}
-	if err := ValidateBackup(&BackupFile{Prefixes: []Prefix{{"", "red", 1}}}); err == nil {
+	if err := ValidateBackup(&BackupFile{Prefixes: []Prefix{{"", "red", 1, 0}}}); err == nil {
 		t.Error("a backup with an empty prefix name should fail")
 	}
 }
@@ -244,10 +244,10 @@ func TestPrefixNameLengthCountsCharacters(t *testing.T) {
 
 func TestBasketsAndDrawing(t *testing.T) {
 	s := newTestStore(t)
-	must(t, s.UpsertTickets([]Ticket{{"A", 5, "Winnie", "Won", "555-0005", "CALL"}}))
+	must(t, s.UpsertTickets([]Ticket{{"A", 5, "Winnie", "Won", "555-0005", "CALL", 0}}))
 	must(t, s.UpsertBaskets([]Basket{
-		{"A", 1, "Wine", "The Smiths", 0},
-		{"A", 2, "Spa day", "", 0},
+		{"A", 1, "Wine", "The Smiths", 0, 0, 0},
+		{"A", 2, "Spa day", "", 0, 0, 0},
 	}))
 
 	// The drawing form only sets winning tickets, and may name a basket that
@@ -269,10 +269,12 @@ func TestBasketsAndDrawing(t *testing.T) {
 	}
 
 	// Saving the baskets form again must not clobber a drawn winner.
-	must(t, s.UpsertBaskets([]Basket{{"A", 1, "Red wine", "The Smiths", 0}}))
+	if _, err := s.SaveBaskets([]BasketSave{{Basket: Basket{Prefix: "A", BID: 1, Description: "Red wine", Donors: "The Smiths"}}}); err != nil {
+		t.Fatal(err)
+	}
 	b, _ := s.Basket("A", 1)
 	if b.Description != "Red wine" || b.WinningTicket != 5 {
-		t.Fatalf("UpsertBaskets must keep the winning ticket: %+v", b)
+		t.Fatalf("the Baskets form's save must keep the winning ticket: %+v", b)
 	}
 
 	rng, _ := s.DrawingRange("A", 1, 3)
@@ -302,12 +304,12 @@ func TestBasketsAndDrawing(t *testing.T) {
 func TestReports(t *testing.T) {
 	s := newTestStore(t)
 	must(t, s.UpsertTickets([]Ticket{
-		{"A", 1, "Zed", "Young", "555-0001", "CALL"},
-		{"A", 2, "Amy", "Adams", "555-0002", "TEXT"},
-		{"A", 3, "Amy", "Adams", "555-0002", "TEXT"},
-		{"B", 1, "Bea", "Brown", "555-0003", "CALL"},
+		{"A", 1, "Zed", "Young", "555-0001", "CALL", 0},
+		{"A", 2, "Amy", "Adams", "555-0002", "TEXT", 0},
+		{"A", 3, "Amy", "Adams", "555-0002", "TEXT", 0},
+		{"B", 1, "Bea", "Brown", "555-0003", "CALL", 0},
 	}))
-	must(t, s.UpsertBaskets([]Basket{{"A", 1, "Wine", "", 1}, {"A", 2, "Spa", "", 2}, {"A", 3, "Books", "", 0}}))
+	must(t, s.UpsertBaskets([]Basket{{"A", 1, "Wine", "", 1, 0, 0}, {"A", 2, "Spa", "", 2, 0, 0}, {"A", 3, "Books", "", 0, 0, 0}}))
 
 	byName, err := s.ReportByName("A")
 	must(t, err)
@@ -332,8 +334,28 @@ func TestReports(t *testing.T) {
 	if got["A"].TotalBuys != 3 || got["A"].UniqueBuyers != 2 || got["B"].TotalBuys != 1 {
 		t.Fatalf("ReportCounts = %v", counts)
 	}
-	if got["Total"].TotalBuys != 4 || got["Total"].UniqueBuyers != 3 {
+	if got["Total"].TotalBuys != 4 || got["Total"].UniqueBuyers != 3 || !got["Total"].IsTotal {
 		t.Fatalf("ReportCounts total = %v", got["Total"])
+	}
+}
+
+// A buyer is a name and phone number together, not their letters run
+// into one text; a prefix named Total is a row of its own.
+func TestCountsTellBuyersAndTheTotalApart(t *testing.T) {
+	s := newTestStore(t)
+	must(t, s.UpsertTickets([]Ticket{
+		{Prefix: "Total", TID: 1, FirstName: "Jo", LastName: "Ann", PhoneNumber: "5", Pref: "CALL"},
+		{Prefix: "Total", TID: 2, FirstName: "Joa", LastName: "nn", PhoneNumber: "5", Pref: "CALL"},
+		{Prefix: "Total", TID: 3, FirstName: "Jo", LastName: "Ann", PhoneNumber: "5", Pref: "CALL"},
+	}))
+	counts, err := s.ReportCounts()
+	must(t, err)
+	want := []ReportCountLine{
+		{Prefix: "Total", UniqueBuyers: 2, TotalBuys: 3},
+		{Prefix: "Total", IsTotal: true, UniqueBuyers: 2, TotalBuys: 3},
+	}
+	if !reflect.DeepEqual(counts, want) {
+		t.Fatalf("counts = %+v, want %+v", counts, want)
 	}
 }
 
@@ -433,6 +455,49 @@ func TestKeyLastSeen(t *testing.T) {
 	}
 }
 
+func TestKeyLastUpdate(t *testing.T) {
+	// Without the server migration there is no auth_key_activity: ListKeys
+	// still works and LastUpdate stays empty and off the wire.
+	plain := newTestStore(t)
+	k, err := plain.CreateKey("client")
+	must(t, err)
+	list, err := plain.ListKeys()
+	must(t, err)
+	if len(list) != 1 || list[0].LastUpdate != "" {
+		t.Fatalf("ListKeys without the table = %+v", list)
+	}
+	if data, _ := json.Marshal(list[0]); strings.Contains(string(data), "last_update") {
+		t.Fatalf("a key without the table must not carry last_update on the wire: %s", data)
+	}
+	if err := plain.MarkKeyUpdated(k.AuthKey); err == nil {
+		t.Fatal("MarkKeyUpdated without the table should fail")
+	}
+
+	s := newTestStore(t)
+	must(t, db.MigrateServer(s.db))
+	k, err = s.CreateKey("client")
+	must(t, err)
+	if list, _ = s.ListKeys(); list[0].LastUpdate != "" {
+		t.Fatalf("a new key has no last_update, got %q", list[0].LastUpdate)
+	}
+	// Being seen is not the same as having written.
+	must(t, s.TouchKey(k.AuthKey))
+	if list, _ = s.ListKeys(); list[0].LastUpdate != "" || list[0].LastSeen == "" {
+		t.Fatalf("after TouchKey = %+v, want last_seen only", list[0])
+	}
+	before := time.Now().Add(-2 * time.Second)
+	must(t, s.MarkKeyUpdated(k.AuthKey))
+	list, _ = s.ListKeys()
+	updated, err := time.Parse(time.RFC3339, list[0].LastUpdate)
+	if err != nil || updated.Before(before) || updated.After(time.Now().Add(2*time.Second)) {
+		t.Fatalf("last_update after MarkKeyUpdated = %q (%v)", list[0].LastUpdate, err)
+	}
+	if data, _ := json.Marshal(list[0]); !strings.Contains(string(data), `"last_update":"`+list[0].LastUpdate+`"`) {
+		t.Fatalf("last_update missing on the wire: %s", data)
+	}
+	must(t, s.MarkKeyUpdated("NOT A KEY")) // no row, no error
+}
+
 func TestCounts(t *testing.T) {
 	s := newTestStore(t)
 	p, tk, b, err := s.Counts()
@@ -440,9 +505,9 @@ func TestCounts(t *testing.T) {
 	if p != 0 || tk != 0 || b != 0 {
 		t.Fatalf("Counts of an empty store = %d %d %d", p, tk, b)
 	}
-	must(t, s.UpsertPrefixes([]Prefix{{"A", "red", 1}, {"B", "blue", 2}}))
-	must(t, s.UpsertTickets([]Ticket{{"A", 1, "", "", "", "CALL"}, {"A", 2, "", "", "", "CALL"}, {"B", 1, "", "", "", "CALL"}}))
-	must(t, s.UpsertBaskets([]Basket{{"A", 1, "Wine", "", 0}}))
+	must(t, s.UpsertPrefixes([]Prefix{{"A", "red", 1, 0}, {"B", "blue", 2, 0}}))
+	must(t, s.UpsertTickets([]Ticket{{"A", 1, "", "", "", "CALL", 0}, {"A", 2, "", "", "", "CALL", 0}, {"B", 1, "", "", "", "CALL", 0}}))
+	must(t, s.UpsertBaskets([]Basket{{"A", 1, "Wine", "", 0, 0, 0}}))
 	p, tk, b, err = s.Counts()
 	must(t, err)
 	if p != 2 || tk != 3 || b != 1 {
@@ -452,10 +517,10 @@ func TestCounts(t *testing.T) {
 
 func TestBackupRoundTrip(t *testing.T) {
 	src := newTestStore(t)
-	must(t, src.UpsertPrefixes([]Prefix{{"A", "red", 1}}))
-	must(t, src.UpsertBaskets([]Basket{{"A", 1, "Wine", "Smiths", 0}}))
+	must(t, src.UpsertPrefixes([]Prefix{{"A", "red", 1, 0}}))
+	must(t, src.UpsertBaskets([]Basket{{"A", 1, "Wine", "Smiths", 0, 0, 0}}))
 	must(t, src.UpsertWinning([]Basket{{Prefix: "A", BID: 1, WinningTicket: 2}}))
-	must(t, src.UpsertTickets([]Ticket{{"A", 2, "Amy", "Adams", "555", "TEXT"}}))
+	must(t, src.UpsertTickets([]Ticket{{"A", 2, "Amy", "Adams", "555", "TEXT", 0}}))
 
 	bf, err := src.Export()
 	must(t, err)

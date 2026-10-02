@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"ticket-auction-manager/tam-go/internal/version"
 )
 
 // echo answers with the request's method, path, headers and body so tests
@@ -21,6 +23,7 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"method": r.Method, "path": r.URL.RequestURI(), "key": r.Header.Get("TAM-KEY"),
 		"pw": r.Header.Get("TAM-PW"), "ct": r.Header.Get("Content-Type"), "body": string(body),
+		"client": r.Header.Get("X-TAM-Client"),
 	})
 }
 
@@ -78,5 +81,36 @@ func TestUnreachableServerIsAnError(t *testing.T) {
 	ts.Close()
 	if _, err := New(ts.URL, "K", false).Get("/api"); err == nil {
 		t.Fatal("a closed server must produce a transport error")
+	}
+}
+
+// TestEveryRequestNamesTheClient: the server's admin page shows which
+// program each client runs, so every request carries the program and its
+// build version.
+func TestEveryRequestNamesTheClient(t *testing.T) {
+	old := version.Version
+	version.Version = "9.9.9-test"
+	t.Cleanup(func() { version.Version = old })
+	ts := httptest.NewServer(http.HandlerFunc(echo))
+	defer ts.Close()
+	c := New(ts.URL, "KEY", false)
+
+	var seen map[string]any
+	for name, call := range map[string]func() (*Response, error){
+		"Get":    func() (*Response, error) { return c.Get("/api") },
+		"Post":   func() (*Response, error) { return c.Post("/api/tickets", []int{}) },
+		"Delete": func() (*Response, error) { return c.Delete("/api/prefixes?p=A") },
+		"Do": func() (*Response, error) {
+			return c.Do(http.MethodGet, "/api", map[string]string{"X-TAM-Pending": "2"}, nil)
+		},
+	} {
+		res, err := call()
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		res.JSON(&seen)
+		if seen["client"] != "tam-client/9.9.9-test" {
+			t.Fatalf("%s sent X-TAM-Client %q, want tam-client/9.9.9-test", name, seen["client"])
+		}
 	}
 }

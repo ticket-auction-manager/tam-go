@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode"
@@ -45,14 +46,15 @@ func FuzzModelsDecode(f *testing.F) {
 		decodeRoundTrip[Prefix](t, data)
 		decodeRoundTrip[Int](t, data)
 
+		// Only a JSON integer, or null, is a whole number.
 		var n Int
-		if json.Unmarshal(data, &n) != nil || !isJSONNumber(data) {
+		if json.Unmarshal(data, &n) != nil {
 			return
 		}
-		quoted, _ := json.Marshal(strings.TrimSpace(string(data)))
-		var s Int
-		if err := json.Unmarshal(quoted, &s); err != nil || s != n {
-			t.Fatalf("the number %s decodes to %d, the string %s to %d (%v)", data, n, quoted, s, err)
+		if text := strings.TrimSpace(string(data)); text != "null" {
+			if _, err := strconv.ParseInt(text, 10, 64); err != nil {
+				t.Fatalf("%q decoded as the whole number %d", data, n)
+			}
 		}
 	})
 }
@@ -76,18 +78,6 @@ func decodeRoundTrip[T comparable](t *testing.T, data []byte) {
 	if again != v {
 		t.Fatalf("%s decoded to the %T %+v, which comes back as %+v through %s", data, v, v, again, out)
 	}
-}
-
-// isJSONNumber reports whether data is one JSON number.
-func isJSONNumber(data []byte) bool {
-	var v any
-	dec := json.NewDecoder(strings.NewReader(string(data)))
-	dec.UseNumber()
-	if dec.Decode(&v) != nil {
-		return false
-	}
-	_, ok := v.(json.Number)
-	return ok && !dec.More()
 }
 
 // FuzzSearchTickets: a search returns exactly the tickets whose three
@@ -115,13 +105,13 @@ func FuzzSearchTickets(f *testing.F) {
 		}
 		// Rows in the order the search returns them: by prefix, then id.
 		rows := []Ticket{
-			{"A", 1, a, b, c, "CALL"},
-			{"A", 2, b, c, a, "TEXT"},
-			{"B", 1, c, a, b, "CALL"},
-			{"B", 2, first, last, phone, "CALL"},
-			{"C", 1, "Ann" + first, strings.ToUpper(last), "(" + phone + ")", "CALL"},
-			{"C", 2, "50%", "a_b", `x\y`, "CALL"},
-			{"C", 3, "", "", "", ""},
+			{"A", 1, a, b, c, "CALL", 0},
+			{"A", 2, b, c, a, "TEXT", 0},
+			{"B", 1, c, a, b, "CALL", 0},
+			{"B", 2, first, last, phone, "CALL", 0},
+			{"C", 1, "Ann" + first, strings.ToUpper(last), "(" + phone + ")", "CALL", 0},
+			{"C", 2, "50%", "a_b", `x\y`, "CALL", 0},
+			{"C", 3, "", "", "", "", 0},
 		}
 		s := newTestStore(t)
 		must(t, s.UpsertTickets(rows))
@@ -293,9 +283,9 @@ func FuzzStoreRoundTrip(f *testing.F) {
 	f.Add("123", int64(123), "1e3", "0x10", "NULL", "null", int64(0), int64(123))
 	f.Fuzz(func(t *testing.T, prefix string, id int64, s1, s2, s3, s4 string, weight, winning int64) {
 		s := newTestStore(t)
-		p := Prefix{prefix, s4, int(weight)}
-		tk := Ticket{prefix, int(id), s1, s2, s3, s4}
-		bk := Basket{prefix, int(id), s1, s2, int(winning)}
+		p := Prefix{Prefix: prefix, Color: s4, Weight: int(weight)}
+		tk := Ticket{Prefix: prefix, TID: int(id), FirstName: s1, LastName: s2, PhoneNumber: s3, Pref: s4}
+		bk := Basket{Prefix: prefix, BID: int(id), Description: s1, Donors: s2, WinningTicket: int(winning)}
 		must(t, s.UpsertPrefixes([]Prefix{p}))
 		must(t, s.UpsertTickets([]Ticket{tk}))
 		must(t, s.UpsertBaskets([]Basket{bk}))

@@ -33,25 +33,41 @@
 			selectPrefixInput();
 			return;
 		}
-		const body = [
-			{
-				prefix: name,
-				color: editPrefix.color,
-				weight: Math.trunc(Number(editPrefix.weight) || 0)
-			}
-		];
+		const row = { prefix: name, color: editPrefix.color, weight: Math.trunc(Number(editPrefix.weight) || 0) };
+		// A prefix opened with Edit goes with the values it had then: a colour
+		// or weight another computer changed meanwhile is not overwritten.
+		const base = editPrefix.from === name ? editPrefix.base : undefined;
 		let res;
 		try {
-			res = await postJSON('/api/prefixes', body);
+			res = await postJSON('/api/prefixes', [base ? { ...row, base } : row]);
 		} catch {
 			status = 'Could not reach the TAM client API';
 			return;
 		}
-		if (res.ok) {
-			window.location.reload();
-		} else {
+		if (!res.ok) {
 			status = await readDetail(res);
+			return;
 		}
+		if (base) {
+			let now = null;
+			try {
+				[now] = await res.json();
+			} catch {
+				// No row in the answer.
+			}
+			const kept = now
+				? [
+						['color', 'color'],
+						['weight', 'weight']
+					].filter(([f]) => String(row[f]) !== String(base[f]) && String(now[f]) !== String(row[f]))
+				: [];
+			if (kept.length > 0) {
+				alert(
+					`Not changed: another computer changed the ${kept.map(([, label]) => label).join(' and ')} of ${name} after you opened it (now ${kept.map(([f]) => now[f]).join(', ')}). Edit it again to change it.`
+				);
+			}
+		}
+		window.location.reload();
 	}
 
 	async function deletePrefix(prefix) {
@@ -171,8 +187,14 @@
 					<td class="border p-0.5">{prefix.weight}</td>
 					<td class="border p-0.5">
 						<div class="flex flex-row gap-1 items-center">
-							<button class={bS[prefix.color]} onclick={() => (editPrefix = { ...prefix })}
-								>Edit</button
+							<button
+								class={bS[prefix.color]}
+								onclick={() =>
+									(editPrefix = {
+										...prefix,
+										from: prefix.prefix,
+										base: { color: prefix.color, weight: prefix.weight }
+									})}>Edit</button
 							>
 							<button class={bS[prefix.color]} onclick={() => deletePrefix(prefix)}>Delete</button>
 						</div>

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,6 +93,11 @@ type Syncer struct {
 	pulling    func()          // tests: runs as a pull starts
 	pullAt     time.Time       // no mirror pull before this, after a download that could not be used
 	running    context.Context // Run's context; the replay stops between saves when it ends
+	event      string          // the event the server named in its last answer to the heartbeat
+
+	// eventChanged sets this client's copy aside when the server holds
+	// another event than the copy's (see OnEventChange).
+	eventChanged func(old, new string) error
 
 	// numbering is held while a save is numbered and then sent or queued,
 	// so saves are numbered, queued and sent directly in one order (see
@@ -114,6 +120,16 @@ type Syncer struct {
 // standalone mode.
 func New(st *store.Store, cfg *config.File, client func(config.Settings) *remote.Client, t Timings) *Syncer {
 	return &Syncer{st: st, cfg: cfg, client: client, t: t, kick: make(chan struct{}, 1)}
+}
+
+// OnEventChange sets what the syncer does when the server holds another
+// event than this client's copy: f gets the copy's event and the server's,
+// and sets the copy and its waiting saves aside (see client's changeEvent).
+// The mirror is then pulled from the server.
+func (s *Syncer) OnEventChange(f func(old, new string) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventChanged = f
 }
 
 // Online reports whether a call to the server is worth trying: the server
@@ -299,6 +315,16 @@ func (s *Syncer) SaveQueued(method, path string, body []byte, order store.Order,
 	return nil
 }
 
+// SaveQueuedAs is SaveQueued for a save whose request depends on what the
+// write did (see store.SaveQueuedAs).
+func (s *Syncer) SaveQueuedAs(method, path string, order store.Order, write func(*store.Store) ([]byte, error)) error {
+	if _, err := s.st.SaveQueuedAs(method, path, order, write); err != nil {
+		return err
+	}
+	s.wake()
+	return nil
+}
+
 // Kick asks the worker to look at the server now.
 func (s *Syncer) Kick() {
 	s.mu.Lock()
@@ -399,11 +425,25 @@ func (s *Syncer) Tick() {
 	s.mu.Lock()
 	ready := s.state == Connected && !time.Now().Before(s.retryAt)
 	s.mu.Unlock()
-	if !ready {
+	if !ready || !s.sameEvent() {
 		return
 	}
-	if _, ok := s.drain(rc); !ok {
+	handled, ok := s.drain(rc)
+	if !ok {
 		return
+	}
+	if handled > 0 {
+		// The server's admin page shows what each client has queued, from
+		// the heartbeat: say at once that the queue is empty, not at the
+		// next heartbeat.
+		s.ping(rc, settings.RemoteKey != "")
+		s.mu.Lock()
+		s.nextPing = time.Now().Add(s.t.Heartbeat)
+		connected := s.state == Connected
+		s.mu.Unlock()
+		if !connected {
+			return
+		}
 	}
 	s.mu.Lock()
 	pull := s.pullNeeded && !time.Now().Before(s.pullAt)
@@ -413,8 +453,17 @@ func (s *Syncer) Tick() {
 	}
 }
 
+// ping is the heartbeat. It tells the server how many saves are queued
+// here (X-TAM-Pending), which its admin page shows; when the count cannot
+// be read the header is left out rather than guessed.
 func (s *Syncer) ping(rc *remote.Client, haveKey bool) {
-	res, err := rc.WithTimeout(s.t.PingTimeout).Get("/api")
+	var headers map[string]string
+	if pending, _, err := s.st.OutboxCounts(); err != nil {
+		log.Printf("outbox: %v", err)
+	} else {
+		headers = map[string]string{"X-TAM-Pending": strconv.Itoa(pending)}
+	}
+	res, err := rc.WithTimeout(s.t.PingTimeout).Do(http.MethodGet, "/api", headers, nil)
 	switch {
 	case err != nil:
 		s.NoteFailure(err)
@@ -424,14 +473,64 @@ func (s *Syncer) ping(rc *remote.Client, haveKey bool) {
 		s.NoteFailure(fmt.Errorf("server answered %d", res.Status))
 	default:
 		var doc struct {
-			Authenticated bool `json:"authenticated"`
+			Authenticated bool   `json:"authenticated"`
+			Event         string `json:"event"`
 		}
 		if json.Unmarshal(res.Body, &doc) == nil && haveKey && !doc.Authenticated {
 			s.NoteUnauthorized()
 			return
 		}
+		s.mu.Lock()
+		s.event = doc.Event
+		s.mu.Unlock()
 		s.NoteSuccess()
 	}
+}
+
+// sameEvent makes sure this client's copy is of the event the server holds
+// before anything goes either way. A copy that names no event yet (a new
+// client, one that worked alone, or one from before events were named)
+// takes the server's. A copy of another event is set aside with the saves
+// still waiting for it (see OnEventChange) and pulled anew. A server that
+// names no event (an earlier version) is taken as it is. It reports
+// whether the replay and the pull may go on.
+func (s *Syncer) sameEvent() bool {
+	s.mu.Lock()
+	server, changed := s.event, s.eventChanged
+	s.mu.Unlock()
+	if server == "" {
+		return true
+	}
+	mine, err := s.st.MirrorEvent()
+	if err != nil {
+		log.Printf("event: %v", err)
+		return false
+	}
+	switch {
+	case mine == server:
+		return true
+	case mine == "":
+		if err := s.st.SetMirrorEvent(server); err != nil {
+			log.Printf("event: %v", err)
+			return false
+		}
+		return true
+	}
+	log.Printf("server %s holds another event than this client's copy: setting the copy aside", s.name())
+	if changed != nil {
+		if err := changed(mine, server); err != nil {
+			log.Printf("event: %v", err)
+			return false
+		}
+	} else if err := s.st.SetMirrorEvent(server); err != nil {
+		log.Printf("event: %v", err)
+		return false
+	}
+	s.mu.Lock()
+	s.pullNeeded = true
+	s.pullAt = time.Time{}
+	s.mu.Unlock()
+	return true
 }
 
 // drain sends queued requests in order and returns how many it took off
@@ -485,12 +584,40 @@ func (s *Syncer) replayOne(rc *remote.Client) (took, ok bool) {
 		s.backOff()
 		return false, false
 	case res.OK():
-		if err := s.st.DeleteOutbox(o.ID); err != nil {
+		// The server answers a form's save with the rows as it stored them:
+		// they go into this client's copy, and the changes it did not make
+		// (another computer changed the field first) into the failed list,
+		// as a save of their own for the volunteer to apply deliberately.
+		var result store.SaveResult
+		if store.SavePath(o.Method, o.Path) {
+			r, err := store.ResultOf(o.Path, o.Body, res.Body)
+			if err != nil {
+				// Not the server's answer (a Wi-Fi login page answers anything):
+				// the save stays queued and goes again.
+				s.noteAttempt(o.ID, err.Error())
+				s.NoteFailure(err)
+				s.backOff()
+				return false, false
+			}
+			result = r
+		}
+		var reason string
+		if len(result.Conflicts) > 0 {
+			reasons := make([]string, len(result.Conflicts))
+			for i, c := range result.Conflicts {
+				reasons[i] = c.String()
+			}
+			reason = strings.Join(reasons, "; ")
+		}
+		if err := s.st.FinishOutbox(o.ID, result.WriteUnlessNewer, result.Again, reason); err != nil {
 			log.Printf("outbox: %v", err)
 			return false, false
 		}
 		s.NoteSuccess()
 		log.Printf("server %s: took a queued %s %s", s.name(), o.Method, o.Path)
+		if reason != "" {
+			log.Printf("server %s: kept newer values over this client's queued %s %s, which is in the failed list: %s", s.name(), o.Method, o.Path, reason)
+		}
 	case res.Status == http.StatusUnauthorized || res.Status == http.StatusForbidden:
 		s.noteAttempt(o.ID, detail(res))
 		s.NoteUnauthorized()
@@ -623,6 +750,11 @@ func (s *Syncer) pull(rc *remote.Client) {
 	saved := s.touched
 	s.mu.Unlock()
 	err = s.st.Import(without(bf, saved))
+	if err == nil && bf.Event != "" {
+		if mine, merr := s.st.MirrorEvent(); merr == nil && mine == "" {
+			err = s.st.SetMirrorEvent(bf.Event)
+		}
+	}
 	s.saving.Unlock()
 	if err != nil {
 		s.pullFailed(fmt.Errorf("its backup could not be copied into this client: %w", err))

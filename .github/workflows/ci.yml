@@ -52,10 +52,13 @@ jobs:
       - name: Build
         run: go build ./...
 
-      - name: Cross-compile check (Windows, with the tray icon)
+      - name: Cross-compile check (every release target)
         run: |
-          GOOS=windows GOARCH=amd64 go vet ./...
-          GOOS=windows GOARCH=amd64 go build ./...
+          for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            echo "== $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go vet ./...
+            GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0 go build ./...
+          done
 
       - name: Printed results on the run page
         if: always()
@@ -145,8 +148,8 @@ jobs:
             ${{ runner.temp }}/load-test.txt
           if-no-files-found: ignore
 
-  compat:
-    name: Compatibility with the original tam
+  browser:
+    name: Browser tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -158,10 +161,10 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
+          cache: pnpm
+          cache-dependency-path: |
+            frontend/pnpm-lock.yaml
+            scripts/browser/pnpm-lock.yaml
 
       - uses: actions/setup-go@v7
         with:
@@ -173,26 +176,41 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Original server with the Go client, then the Go server with both clients
-        run: bash scripts/compat/run.sh 2>&1 | tee "$RUNNER_TEMP/compatibility.txt"
+      - name: Build the real Linux programs
+        run: go build -o "$RUNNER_TEMP/" ./cmd/tam-client ./cmd/tam-server
+
+      - name: Install the pinned browser test tools
+        working-directory: scripts/browser
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Saves, newer values kept, reports from a client's copy
+        working-directory: scripts/browser
+        env:
+          TAM_CLIENT_BIN: ${{ runner.temp }}/tam-client
+          TAM_SERVER_BIN: ${{ runner.temp }}/tam-server
+        run: pnpm test 2>&1 | tee "$RUNNER_TEMP/browser-tests.txt"
 
       - name: Printed results on the run page
         if: always()
         run: |
           {
-            echo '### Compatibility with the original tam'
+            echo '### Browser tests'
             echo '```'
-            cat "$RUNNER_TEMP/compatibility.txt" 2>/dev/null || echo "(the run did not start)"
+            cat "$RUNNER_TEMP/browser-tests.txt" 2>/dev/null || echo "(the tests did not run)"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Keep the printed results with the run
+      - name: Keep browser results and failure traces
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: compatibility
+          name: browser-tests
           path: |
-            ${{ runner.temp }}/compatibility.txt
+            ${{ runner.temp }}/browser-tests.txt
+            scripts/browser/playwright-report/
+            scripts/browser/test-results/
           if-no-files-found: ignore
 
   load:
@@ -303,4 +321,107 @@ jobs:
           path: |
             ${{ runner.temp }}/nix-build.txt
             ${{ runner.temp }}/nixos-test.txt
+          if-no-files-found: ignore
+
+  packages:
+    name: Release build, and the Linux packages installed, upgraded and removed
+    runs-on: ubuntu-latest
+    # bash with -o pipefail: a test piped into tee fails its step when it fails.
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the tags, for git describe
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build the web app
+        working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Release build (every system, the version from git describe)
+        run: |
+          version="$(git describe --tags --always --dirty)"
+          echo "PACKAGE_VERSION=$version" >> "$GITHUB_ENV"
+          {
+            SKIP_WEB=1 VERSION="$version" ./build.sh release
+            echo
+            echo "The Linux archive, as tar lists it:"
+            tar -tvzf build/tam-client-*-linux-amd64.tar.gz
+          } 2>&1 | tee "$RUNNER_TEMP/release-build.txt"
+
+      - name: Keep the archives, the Windows programs and the packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-build
+          path: |
+            build/*.zip
+            build/*.tar.gz
+            build/*.exe
+            build/*.deb
+            build/*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: The same version as package revision 2, to upgrade to
+        run: |
+          mkdir -p "$RUNNER_TEMP/packages-1" "$RUNNER_TEMP/packages-2"
+          cp build/*_amd64.deb build/*.x86_64.rpm "$RUNNER_TEMP/packages-1/"
+          SKIP_WEB=1 VERSION="$PACKAGE_VERSION" PKG_RELEASE=2 ./build.sh release > "$RUNNER_TEMP/release-build-2.txt" 2>&1
+          cp build/*_amd64.deb build/*.x86_64.rpm "$RUNNER_TEMP/packages-2/"
+          ls -l "$RUNNER_TEMP/packages-1" "$RUNNER_TEMP/packages-2"
+
+      - name: The .deb packages on this runner, with systemd
+        run: sudo deploy/linux/test-packages.sh "$RUNNER_TEMP/packages-1" "$RUNNER_TEMP/packages-2" 2>&1 | tee "$RUNNER_TEMP/deb-packages.txt"
+
+      - name: The .rpm packages in a Fedora container, with a stand-in for systemctl
+        run: |
+          docker run --rm -v "$PWD/deploy/linux:/test:ro" \
+            -v "$RUNNER_TEMP/packages-1:/packages-1:ro" -v "$RUNNER_TEMP/packages-2:/packages-2:ro" \
+            fedora:42 bash /test/test-packages.sh --fake-systemd /packages-1 /packages-2 2>&1 | tee "$RUNNER_TEMP/rpm-packages.txt"
+
+      - name: Printed results on the run page
+        if: always()
+        run: |
+          {
+            echo '### Release build'
+            echo '```'
+            cat "$RUNNER_TEMP/release-build.txt" 2>/dev/null || echo "(the build did not run)"
+            echo '```'
+            echo '### The .deb packages on the runner, with systemd'
+            echo '```'
+            cat "$RUNNER_TEMP/deb-packages.txt" 2>/dev/null || echo "(the test did not run)"
+            echo '```'
+            echo '### The .rpm packages in a Fedora container, with a stand-in for systemctl'
+            echo '```'
+            cat "$RUNNER_TEMP/rpm-packages.txt" 2>/dev/null || echo "(the test did not run)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep the printed results with the run
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: packages
+          path: |
+            ${{ runner.temp }}/release-build.txt
+            ${{ runner.temp }}/release-build-2.txt
+            ${{ runner.temp }}/deb-packages.txt
+            ${{ runner.temp }}/rpm-packages.txt
           if-no-files-found: ignore

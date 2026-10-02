@@ -1,9 +1,9 @@
-import { getJSON } from '$lib/client/api';
+import { getJSON, getReport } from '$lib/client/api';
 
 export const load = async ({ params, fetch }) => {
-	const [prefixes, reportLines, settings] = await Promise.all([
+	const [prefixes, report, settings] = await Promise.all([
 		getJSON('/api/prefixes', { fetch }),
-		getJSON(`/api/reports/byname/${encodeURIComponent(params.prefix)}`, { fetch }),
+		getReport(`/api/reports/byname/${encodeURIComponent(params.prefix)}`, { fetch }),
 		getJSON('/api/settings', { fetch })
 	]);
 	const prefix = Array.from(prefixes).find((p) => p.prefix == params.prefix) || {
@@ -11,5 +11,12 @@ export const load = async ({ params, fetch }) => {
 		color: 'gray',
 		weight: 0
 	};
-	return { prefixes, prefix, reportLines, venueName: settings.venue_name || '' };
+	return {
+		prefixes,
+		prefix,
+		reportLines: report.data,
+		fromCopy: report.fromCopy,
+		asOf: new Date(),
+		venueName: settings.venue_name || ''
+	};
 };

@@ -332,37 +332,39 @@ func TestStandalonePrefixesAndTickets(t *testing.T) {
 	}
 }
 
-// TestRangeSpanningEveryIDIsCut: a range wider than half of the ints makes
-// to-from overflow. It must still be cut to the page size, starting at its
-// lower end, like any other range that is too wide.
+// maxID is the largest id: the largest whole number a browser holds exactly.
+const maxID = 1<<53 - 1
+
+// TestRangeSpanningEveryIDIsCut: a range over every id is cut to the page
+// size, starting at its lower end, like any other range that is too wide;
+// an id outside 0 to maxID is refused.
 func TestRangeSpanningEveryIDIsCut(t *testing.T) {
 	f := newFixture(t)
-	for _, from := range []int{-1, math.MinInt} {
-		code, body := f.do("GET", fmt.Sprintf("/api/tickets/A/%d/%d", from, math.MaxInt), nil, nil)
-		if code != 200 {
-			t.Fatalf("range from %d to the largest id = %d %s", from, code, body)
-		}
-		rng := decode[[]store.Ticket](t, body)
-		if len(rng) != rangeLimit+1 {
-			t.Fatalf("range from %d to the largest id has %d rows, want %d", from, len(rng), rangeLimit+1)
-		}
-		if rng[0].TID != from || rng[rangeLimit].TID != from+rangeLimit {
-			t.Fatalf("range from %d to the largest id runs from %d to %d, want %d to %d", from, rng[0].TID, rng[rangeLimit].TID, from, from+rangeLimit)
+	code, body := f.do("GET", fmt.Sprintf("/api/tickets/A/0/%d", maxID), nil, nil)
+	if code != 200 {
+		t.Fatalf("range from 0 to the largest id = %d %s", code, body)
+	}
+	rng := decode[[]store.Ticket](t, body)
+	if len(rng) != rangeLimit+1 || rng[0].TID != 0 || rng[rangeLimit].TID != rangeLimit {
+		t.Fatalf("range from 0 to the largest id has %d rows, want 0 to %d", len(rng), rangeLimit)
+	}
+	for _, path := range []string{"/api/tickets/A/-1/5", fmt.Sprintf("/api/tickets/A/0/%d", maxID+1), fmt.Sprintf("/api/tickets/A/0/%d", math.MaxInt)} {
+		if code, body := f.do("GET", path, nil, nil); code != 400 {
+			t.Fatalf("GET %s = %d %s, want 400", path, code, body)
 		}
 	}
 }
 
-// TestRangeEndingAtTheLargestID: a ticket may have the largest id there is,
-// and the range that ends there must list it and stop instead of counting
-// on past the end of the ints.
+// TestRangeEndingAtTheLargestID: a ticket may have the largest id, and the
+// range that ends there lists it and stops.
 func TestRangeEndingAtTheLargestID(t *testing.T) {
 	f := newFixture(t)
-	if code, body := f.do("POST", "/api/tickets", []store.Ticket{{Prefix: "A", TID: math.MaxInt, FirstName: "Last", Pref: "CALL"}}, nil); code != 200 {
+	if code, body := f.do("POST", "/api/tickets", []store.Ticket{{Prefix: "A", TID: maxID, FirstName: "Last", Pref: "CALL"}}, nil); code != 200 {
 		t.Fatalf("save = %d %s", code, body)
 	}
-	_, body := f.do("GET", fmt.Sprintf("/api/tickets/A/%d/%d", math.MaxInt-2, math.MaxInt), nil, nil)
+	_, body := f.do("GET", fmt.Sprintf("/api/tickets/A/%d/%d", maxID-2, maxID), nil, nil)
 	rng := decode[[]store.Ticket](t, body)
-	if len(rng) != 3 || rng[0].TID != math.MaxInt-2 || rng[2].TID != math.MaxInt || rng[2].FirstName != "Last" {
+	if len(rng) != 3 || rng[0].TID != maxID-2 || rng[2].TID != maxID || rng[2].FirstName != "Last" {
 		t.Fatalf("range up to the largest id = %+v, want two placeholders and the saved ticket", rng)
 	}
 }
@@ -709,9 +711,8 @@ func TestStandaloneAuthAndPush(t *testing.T) {
 
 // recorder stands in for a server and records every write it receives.
 type recorder struct {
-	mu            sync.Mutex
-	writes        []recordedWrite
-	drawingStatus int
+	mu     sync.Mutex
+	writes []recordedWrite
 }
 
 type recordedWrite struct {
@@ -721,18 +722,13 @@ type recordedWrite struct {
 
 func newRecorder(t *testing.T, f *fixture) *recorder {
 	t.Helper()
-	rec := &recorder{drawingStatus: 200}
+	rec := &recorder{}
 	rs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			body, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()
 			rec.writes = append(rec.writes, recordedWrite{r.URL.Path, body})
-			status := rec.drawingStatus
 			rec.mu.Unlock()
-			if r.URL.Path == "/api/drawing" && status != 200 {
-				httpx.WriteError(w, status, "no drawing today")
-				return
-			}
 			httpx.WriteJSON(w, 200, map[string]string{"message": "ok"})
 			return
 		}
@@ -746,12 +742,6 @@ func newRecorder(t *testing.T, f *fixture) *recorder {
 		t.Fatal(err)
 	}
 	return rec
-}
-
-func (rec *recorder) refuseDrawing(status int) {
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	rec.drawingStatus = status
 }
 
 func (rec *recorder) paths() []string {
@@ -775,11 +765,9 @@ func (rec *recorder) body(path string) []byte {
 	return nil
 }
 
-// A restore into a server carries the winning tickets through the drawing
-// route as well. The original server's restore leaves the winning ticket of
-// a basket it already has untouched; the drawing route sets it on every
-// server, so the restore comes out complete on both.
-func TestRestoreIntoServerCarriesWinningTickets(t *testing.T) {
+// A restore into a server is one request: the server's restore writes the
+// winning tickets with the baskets.
+func TestRestoreIntoServerIsOneRequest(t *testing.T) {
 	f := newFixture(t)
 	rec := newRecorder(t, f)
 	bf := store.NewBackupFile()
@@ -787,12 +775,11 @@ func TestRestoreIntoServerCarriesWinningTickets(t *testing.T) {
 	if code, body := f.do("POST", "/api/backuprestore/remote", bf, nil); code != 200 {
 		t.Fatalf("restore = %d %s", code, body)
 	}
-	if got := rec.paths(); !reflect.DeepEqual(got, []string{"/api/backuprestore", "/api/drawing"}) {
-		t.Fatalf("the server received %v, want the restore and then the drawing", got)
+	if got := rec.paths(); !reflect.DeepEqual(got, []string{"/api/backuprestore"}) {
+		t.Fatalf("the server received %v, want the restore alone", got)
 	}
-	var lines []store.Basket
-	if err := json.Unmarshal(rec.body("/api/drawing"), &lines); err != nil || len(lines) != 2 || lines[0].WinningTicket != 7 || lines[1].BID != 2 || lines[1].WinningTicket != 0 {
-		t.Fatalf("drawing body = %s", rec.body("/api/drawing"))
+	if !strings.Contains(string(rec.body("/api/backuprestore")), `"winning_ticket":7`) {
+		t.Fatalf("restore body = %s", rec.body("/api/backuprestore"))
 	}
 }
 
@@ -805,35 +792,10 @@ func TestPushBasketsCarriesWinningTickets(t *testing.T) {
 	if code, body := f.do("POST", "/api/backuprestore/push/baskets", `{}`, nil); code != 200 {
 		t.Fatalf("push = %d %s", code, body)
 	}
-	if got := rec.paths(); !reflect.DeepEqual(got, []string{"/api/backuprestore", "/api/drawing"}) {
-		t.Fatalf("the server received %v, want the restore and then the drawing", got)
-	}
-	if !strings.Contains(string(rec.body("/api/drawing")), `"winning_ticket":7`) {
-		t.Fatalf("drawing body = %s", rec.body("/api/drawing"))
-	}
-}
-
-// Prefixes and tickets carry no winning tickets, so nothing follows them.
-func TestPushTicketsSendsNoDrawing(t *testing.T) {
-	f := newFixture(t)
-	rec := newRecorder(t, f)
-	if code, body := f.do("POST", "/api/backuprestore/push/tickets", `{}`, nil); code != 200 {
-		t.Fatalf("push = %d %s", code, body)
-	}
 	if got := rec.paths(); !reflect.DeepEqual(got, []string{"/api/backuprestore"}) {
-		t.Fatalf("the server received %v, want only the restore", got)
+		t.Fatalf("the server received %v, want the restore alone", got)
 	}
-}
-
-// A refused drawing means the restore did not complete, and the page must
-// hear that rather than a success.
-func TestRestoreIntoServerReportsARefusedDrawing(t *testing.T) {
-	f := newFixture(t)
-	rec := newRecorder(t, f)
-	rec.refuseDrawing(500)
-	bf := store.NewBackupFile()
-	bf.Baskets = []store.Basket{{Prefix: "A", BID: 1, Description: "Wine", WinningTicket: 7}}
-	if code, body := f.do("POST", "/api/backuprestore/remote", bf, nil); code != 500 || !strings.Contains(string(body), "no drawing today") {
-		t.Fatalf("restore = %d %s, want the server's refusal", code, body)
+	if !strings.Contains(string(rec.body("/api/backuprestore")), `"winning_ticket":7`) {
+		t.Fatalf("push body = %s", rec.body("/api/backuprestore"))
 	}
 }

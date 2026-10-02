@@ -2,6 +2,8 @@
 	import { prefixPage } from '$lib/client/paths';
 	import HeaderBar from '$lib/client/components/HeaderBar.svelte';
 	import { bAS, bS } from '$lib/client/styles';
+	import { getReport, errorMessage } from '$lib/client/api';
+	import { untrack, tick } from 'svelte';
 
 	let currentFilter = $state('');
 	let { data } = $props();
@@ -12,13 +14,30 @@
 
 	const headers = ['Basket ID', 'Description', 'Winning Ticket', 'Winner Name', 'Phone Number'];
 
+	// The report as last read, and whether it came from this computer's
+	// copy because the server could not be reached. Print reads it again
+	// first, so a page left open does not print winners entered since.
+	let report = $state(untrack(() => ({ lines: data.reportLines, fromCopy: data.fromCopy, asOf: data.asOf })));
+
+	async function print() {
+		try {
+			const fresh = await getReport(`/api/reports/bybasket/${encodeURIComponent(prefix.prefix)}`);
+			report = { lines: fresh.data, fromCopy: fresh.fromCopy, asOf: new Date() };
+		} catch (e) {
+			const asOf = report.asOf.toLocaleTimeString();
+			if (!confirm(`The report could not be read again (${errorMessage(e)}). Print the rows on screen, as of ${asOf}?`)) return;
+		}
+		await tick();
+		window.print();
+	}
+
 	let reportLines = $derived.by(() => {
 		if (currentFilter == 'CALL') {
-			return data.reportLines.filter((l) => l.pref == 'CALL');
+			return report.lines.filter((l) => l.pref == 'CALL');
 		} else if (currentFilter == 'TEXT') {
-			return data.reportLines.filter((l) => l.pref == 'TEXT');
+			return report.lines.filter((l) => l.pref == 'TEXT');
 		} else {
-			return data.reportLines;
+			return report.lines;
 		}
 	});
 </script>
@@ -65,7 +84,7 @@
 						>
 					</div>
 					<div class="flex flex-row gap-1">
-						<button class={bS[prefix.color]} onclick={() => window.print()}>Print</button>
+						<button class={bS[prefix.color]} onclick={print}>Print</button>
 					</div>
 				</div>
 			</td>
@@ -76,6 +95,17 @@
 		<tr>
 			<th colspan="50"><h2 class="italic text-left">{filterTitle}</h2></th>
 		</tr>
+		<tr>
+			<th colspan="50" class="text-left text-xs font-normal">As of {report.asOf.toLocaleString()}</th>
+		</tr>
+		{#if report.fromCopy}
+			<tr>
+				<th colspan="50" class="text-left text-sm font-bold text-red-700">
+					From this computer's copy: the server could not be reached. Winners entered on other
+					computers since this one last reached the server are not in it.
+				</th>
+			</tr>
+		{/if}
 		<tr class="text-sm">
 			{#each headers as header (header)}
 				<th class="text-left border p-0.5">{header}</th>

@@ -52,9 +52,9 @@ func (s *Store) ReportByBasket(prefix string) ([]ReportByBasketLine, error) {
 }
 
 // ReportCounts returns unique buyers and total buys per prefix, followed by
-// a "Total" row.
+// the total row (IsTotal).
 func (s *Store) ReportCounts() ([]ReportCountLine, error) {
-	rows, err := s.db.Query(`SELECT prefix, unique_buyers, total_buys FROM report_counts`)
+	rows, err := s.db.Query(`SELECT prefix, is_total, unique_buyers, total_buys FROM report_counts ORDER BY is_total, prefix`)
 	if err != nil {
 		return nil, err
 	}
@@ -64,7 +64,7 @@ func (s *Store) ReportCounts() ([]ReportCountLine, error) {
 		var l ReportCountLine
 		var prefix sql.NullString
 		var unique, total sql.NullInt64
-		if err := rows.Scan(&prefix, &unique, &total); err != nil {
+		if err := rows.Scan(&prefix, &l.IsTotal, &unique, &total); err != nil {
 			return nil, err
 		}
 		l.Prefix, l.UniqueBuyers, l.TotalBuys = nstr(prefix), nint(unique), nint(total)

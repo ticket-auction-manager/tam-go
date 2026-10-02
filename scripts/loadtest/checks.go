@@ -85,7 +85,46 @@ func decodeJSON(res *http.Response, into any) error {
 		body, _ := io.ReadAll(res.Body)
 		return fmt.Errorf("answered %d: %s", res.StatusCode, strings.TrimSpace(string(body)))
 	}
-	return json.NewDecoder(res.Body).Decode(into)
+	if err := json.NewDecoder(res.Body).Decode(into); err != nil {
+		return err
+	}
+	valuesOnly(into)
+	return nil
+}
+
+// valuesOnly clears the order numbers the server stamps on rows (see
+// store.Event) in what a program answered: the checks compare the values
+// that were saved.
+func valuesOnly(into any) {
+	switch v := into.(type) {
+	case *store.Ticket:
+		v.Rev = 0
+	case *store.Basket:
+		v.Rev, v.WinRev = 0, 0
+	case *store.DrawingLine:
+		v.WinRev = 0
+	case *[]store.Ticket:
+		for i := range *v {
+			(*v)[i].Rev = 0
+		}
+	case *[]store.Basket:
+		for i := range *v {
+			(*v)[i].Rev, (*v)[i].WinRev = 0, 0
+		}
+	case *[]store.Prefix:
+		for i := range *v {
+			(*v)[i].Rev = 0
+		}
+	case *[]store.DrawingLine:
+		for i := range *v {
+			(*v)[i].WinRev = 0
+		}
+	case *store.BackupFile:
+		v.Event = ""
+		valuesOnly(&v.Prefixes)
+		valuesOnly(&v.Tickets)
+		valuesOnly(&v.Baskets)
+	}
 }
 
 func (t *test) checkData(when string) {

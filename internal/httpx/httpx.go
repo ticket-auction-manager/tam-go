@@ -99,6 +99,10 @@ func IntParam(r *http.Request, name string) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer", name)
 	}
+	// Ids are whole numbers from 0 to the largest a browser holds exactly.
+	if n < 0 || int64(n) > 1<<53-1 {
+		return 0, fmt.Errorf("%s must be between 0 and 9007199254740991", name)
+	}
 	return n, nil
 }
 

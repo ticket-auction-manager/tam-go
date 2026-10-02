@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"ticket-auction-manager/tam-go/internal/presence"
 	"ticket-auction-manager/tam-go/internal/store"
 )
 
@@ -68,8 +70,8 @@ func TestSavesFromAClientApplyInOrder(t *testing.T) {
 	if code, _ := a.orderedSave("L1", "8", "eighth"); code != 200 || a.phone() != "eighth" {
 		t.Fatalf("a newer save = %d, the ticket reads %q", code, a.phone())
 	}
-	if code, _ := a.orderedSave("", "", "unnumbered"); code != 200 || a.phone() != "unnumbered" {
-		t.Fatalf("an unnumbered save = %d, the ticket reads %q", code, a.phone())
+	if code, _ := a.orderedSave("", "", "unnumbered"); code != 400 || a.phone() != "eighth" {
+		t.Fatalf("an unnumbered save = %d, the ticket reads %q; want 400 and eighth", code, a.phone())
 	}
 	for _, bad := range []string{"0", "-1", "x"} {
 		if code, _ := a.orderedSave("L1", bad, "bad"); code != 400 {
@@ -104,5 +106,30 @@ func TestStaleDeleteAnswersAsDone(t *testing.T) {
 	}
 	if code, h := del("3"); code != 200 || h.Get("X-TAM-Stale") != "1" {
 		t.Fatalf("the same delete again = %d, stale %q; want 200 and marked stale", code, h.Get("X-TAM-Stale"))
+	}
+}
+
+// TestARepeatedSaveIsNoUpdate: the admin page's "last update" of a client
+// moves with the saves the server applied; a save arriving again, which
+// changes nothing (X-TAM-Stale), or one refused as older (409), does not
+// move it.
+func TestARepeatedSaveIsNoUpdate(t *testing.T) {
+	now := time.Date(2026, 9, 27, 20, 0, 0, 0, time.UTC)
+	reg := presence.New(func() time.Time { return now })
+	a := newAPI(t, WithPresence(reg))
+	if code, _ := a.orderedSave("L1", "5", "fifth"); code != 200 {
+		t.Fatalf("save = %d", code)
+	}
+	applied := now
+	now = now.Add(time.Minute)
+	if code, h := a.orderedSave("L1", "5", "fifth"); code != 200 || h.Get("X-TAM-Stale") != "1" {
+		t.Fatalf("the same save again = %d, stale %q", code, h.Get("X-TAM-Stale"))
+	}
+	now = now.Add(time.Minute)
+	if code, _ := a.orderedSave("L1", "4", "older"); code != 409 {
+		t.Fatalf("an older save = %d, want 409", code)
+	}
+	if rec := reg.Snapshot()[a.key]; rec.Updated != applied || rec.Seen != now {
+		t.Fatalf("after a repeat and an older save: %+v, want updated at the applied save and seen now", rec)
 	}
 }

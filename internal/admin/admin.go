@@ -15,6 +15,7 @@ import (
 
 	"ticket-auction-manager/tam-go/internal/guard"
 	"ticket-auction-manager/tam-go/internal/httpx"
+	"ticket-auction-manager/tam-go/internal/presence"
 	"ticket-auction-manager/tam-go/internal/store"
 )
 
@@ -47,7 +48,16 @@ type Info struct {
 	DataDir   string    // where the database, log and server.json live
 	Version   string    // the program version
 	Started   time.Time // when the server started, for the uptime
+
+	// Presence is the API's record of what each client last did, for the
+	// Clients table. Without it the table shows what the database
+	// remembers.
+	Presence *presence.Registry
 }
+
+// connectedWithin is how recently a client must have been seen to count as
+// connected: three of the client's 5 s heartbeats.
+const connectedWithin = 15 * time.Second
 
 type handler struct {
 	st      *store.Store
@@ -181,11 +191,30 @@ type keyRow struct {
 	LastSeen    string
 }
 
+// clientRow is one paired client as the status page and its JSON show it.
+type clientRow struct {
+	Name       string `json:"name"`        // the key's description, the client's name
+	Program    string `json:"program"`     // the program and its version, "" when unknown
+	State      string `json:"state"`       // connected, away for ..., or never
+	LastSeen   string `json:"last_seen"`   // as formatSeen writes it
+	LastUpdate string `json:"last_update"` // as formatSeen writes it
+	Queued     *int   `json:"queued"`      // nil when the client never sent a heartbeat
+}
+
 type statusData struct {
 	Info
 	Uptime                     string
 	Prefixes, Tickets, Baskets int
-	Keys                       []keyRow
+	Clients                    []clientRow
+}
+
+// statusJSON is the status page for scripts.
+type statusJSON struct {
+	Uptime   string      `json:"uptime"`
+	Prefixes int         `json:"prefixes"`
+	Tickets  int         `json:"tickets"`
+	Baskets  int         `json:"baskets"`
+	Clients  []clientRow `json:"clients"`
 }
 
 type keysData struct {
@@ -295,12 +324,22 @@ func (h *handler) formSession(w http.ResponseWriter, r *http.Request) *session {
 	return s
 }
 
+// wantsJSON reports whether the request asked for JSON, as a script does.
+func wantsJSON(r *http.Request) bool {
+	return strings.Contains(r.Header.Get("Accept"), "application/json")
+}
+
 // loggedIn wraps a page that needs a login. A visitor without one is sent
-// to the login form; a POST without the session's token is refused.
+// to the login form, or told so in JSON when that is what was asked for;
+// a POST without the session's token is refused.
 func (h *handler) loggedIn(next func(http.ResponseWriter, *http.Request, *session)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := h.ss.get(cookieID(r))
 		if s == nil || !s.loggedIn {
+			if wantsJSON(r) {
+				httpx.WriteError(w, http.StatusUnauthorized, "Not logged in")
+				return
+			}
 			http.Redirect(w, r, "/admin/", http.StatusSeeOther)
 			return
 		}
@@ -429,12 +468,73 @@ func (h *handler) status(w http.ResponseWriter, r *http.Request, s *session) {
 		return
 	}
 	now := h.ss.now()
-	h.render(w, http.StatusOK, "status", h.view(s, "status", statusData{
+	data := statusData{
 		Info:     h.info,
 		Uptime:   formatUptime(now.Sub(h.info.Started)),
 		Prefixes: prefixes, Tickets: tickets, Baskets: baskets,
-		Keys: keyRows(keys, now),
-	}))
+		Clients: clientRows(keys, h.snapshot(), now),
+	}
+	if wantsJSON(r) {
+		httpx.WriteJSON(w, http.StatusOK, statusJSON{Uptime: data.Uptime, Prefixes: prefixes, Tickets: tickets, Baskets: baskets, Clients: data.Clients})
+		return
+	}
+	h.render(w, http.StatusOK, "status", h.view(s, "status", data))
+}
+
+// snapshot returns the registry's records, or nothing without a registry.
+func (h *handler) snapshot() map[string]presence.Record {
+	if h.info.Presence == nil {
+		return nil
+	}
+	return h.info.Presence.Snapshot()
+}
+
+// clientRows joins the keys with what the registry saw of each. The times
+// in memory are exact and win; the persisted ones stand in after a
+// restart until the client shows up again.
+func clientRows(keys []store.AuthKey, live map[string]presence.Record, now time.Time) []clientRow {
+	rows := make([]clientRow, 0, len(keys))
+	for _, k := range keys {
+		rec := live[k.AuthKey]
+		seen := pick(rec.Seen, k.LastSeen)
+		row := clientRow{
+			Name:       k.Description,
+			Program:    rec.Client,
+			State:      stateOf(seen, now),
+			LastSeen:   formatAgo(seen, now),
+			LastUpdate: formatAgo(pick(rec.Updated, k.LastUpdate), now),
+		}
+		if rec.HasPending {
+			pending := rec.Pending
+			row.Queued = &pending
+		}
+		rows = append(rows, row)
+	}
+	return rows
+}
+
+// pick returns the live time when there is one, else the persisted RFC
+// 3339 value, else the zero time.
+func pick(live time.Time, persisted string) time.Time {
+	if !live.IsZero() {
+		return live
+	}
+	t, err := time.Parse(time.RFC3339, persisted)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// stateOf is the connection state of a client last seen at seen.
+func stateOf(seen, now time.Time) string {
+	switch {
+	case seen.IsZero():
+		return "never"
+	case now.Sub(seen) <= connectedWithin:
+		return "connected"
+	}
+	return "away for " + formatUptime(now.Sub(seen))
 }
 
 func keyRows(keys []store.AuthKey, now time.Time) []keyRow {
@@ -472,8 +572,8 @@ func formatUptime(d time.Duration) string {
 	return fmt.Sprintf("%d s", seconds)
 }
 
-// formatSeen turns a last_seen value into local time plus how long ago
-// that was; "" is "never".
+// formatSeen turns a persisted last_seen value into local time plus how
+// long ago that was; "" is "never".
 func formatSeen(seen string, now time.Time) string {
 	if seen == "" {
 		return "never"
@@ -481,6 +581,15 @@ func formatSeen(seen string, now time.Time) string {
 	t, err := time.Parse(time.RFC3339, seen)
 	if err != nil {
 		return seen
+	}
+	return formatAgo(t, now)
+}
+
+// formatAgo writes t as local time plus how long before now that was; the
+// zero time is "never".
+func formatAgo(t, now time.Time) string {
+	if t.IsZero() {
+		return "never"
 	}
 	ago := now.Sub(t)
 	var rel string

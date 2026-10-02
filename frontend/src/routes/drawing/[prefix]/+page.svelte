@@ -1,7 +1,7 @@
 <script>
 	import { prefixPage } from '$lib/client/paths';
 	import { bS, bAS, iS, rBS } from '$lib/client/styles';
-	import { getJSON, saveMarked, saveOnLeave, errorMessage } from '$lib/client/api';
+	import { getJSON, saveMarked, saveOnLeave, errorMessage, startFrom, rowValues, DRAWING_FORM } from '$lib/client/api';
 	import HeaderBar from '$lib/client/components/HeaderBar.svelte';
 	import PagerBar from '$lib/client/components/PagerBar.svelte';
 	import CommandBar from '$lib/client/components/CommandBar.svelte';
@@ -77,7 +77,7 @@
 				return;
 			}
 			resData.map((i) => (i.changed = false));
-			items = [...resData];
+			items = startFrom(DRAWING_FORM, resData);
 			setTimeout(() => focusIdx(0));
 		},
 		// Resolves to false when the marked rows could not be saved.
@@ -85,8 +85,9 @@
 			const problem = await saveMarked('/api/drawing', itemsBuffer, {
 				keepalive: !!opts.keepalive,
 				// A drawing line stores its winning ticket; the winner's name
-				// beside it only shows the lookup, which may answer meanwhile.
-				saved: (line) => line.winning_ticket
+				// beside it shows the lookup of the winner now saved.
+				form: DRAWING_FORM,
+				after: showWinner
 			});
 			// A save made as the page is hidden or closed shows nothing and leaves
 			// the cursor where it is: the volunteer may come back to the row.
@@ -138,8 +139,7 @@
 		},
 		dupDown() {
 			if (items[nextIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 'b_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 'b_id');
 				items[nextIdx] = { ...items[nextIdx], ...buffer, changed: true };
 				this.nextLine();
 			} else {
@@ -148,8 +148,7 @@
 		},
 		dupUp() {
 			if (curIdx > 0) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 'b_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 'b_id');
 				items[prevIdx] = { ...items[prevIdx], ...buffer, changed: true };
 				this.prevLine();
 			} else {
@@ -158,15 +157,14 @@
 		},
 		copy() {
 			if (items[curIdx]) {
-				const buffer = { ...items[curIdx] };
-				['prefix', 'b_id'].forEach((key) => delete buffer[key]);
+				const buffer = rowValues(items[curIdx], 'b_id');
 				window.localStorage.setItem('tam-drawing', JSON.stringify(buffer));
 			}
 			focusIdx(curIdx);
 		},
 		paste() {
 			if (items[curIdx]) {
-				const buffer = JSON.parse(window.localStorage.getItem('tam-drawing'));
+				const buffer = rowValues(JSON.parse(window.localStorage.getItem('tam-drawing')), 'b_id');
 				items[curIdx] = { ...items[curIdx], ...buffer, changed: true };
 			}
 			focusIdx(curIdx);

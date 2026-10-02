@@ -92,6 +92,7 @@ func newHandler(st *store.Store, settingsPath string, dist fs.FS, opts ...Option
 		opt(h)
 	}
 	h.sync = tamsync.New(st, h.cfg, h.remote, h.timings)
+	h.sync.OnEventChange(h.changeEvent)
 	if h.runCtx != nil {
 		go func() {
 			h.sync.Run(h.runCtx)
@@ -120,6 +121,7 @@ func (h *handler) routes(dist fs.FS) http.Handler {
 	mux.HandleFunc("GET /api/servers", h.servers)
 	mux.HandleFunc("POST /api/pair", guard(h.pair))
 	mux.HandleFunc("POST /api/unpair", guard(h.unpair))
+	mux.HandleFunc("GET /api/outbox/failed", h.failedOutbox)
 	mux.HandleFunc("POST /api/outbox/retry", guard(h.retryOutbox))
 	mux.HandleFunc("POST /api/outbox/discard", guard(h.discardOutbox))
 

@@ -21,7 +21,6 @@
 	$effect(() => () => clearTimeout(reloadTimer));
 
 	// --- Server section: pairing, discovered servers and the failed saves ---
-	const NOT_SUPPORTED = 'This client does not support pairing yet';
 	const SERVERS_POLL_MS = 5000;
 	const STATUS_POLL_MS = 5000;
 
@@ -34,7 +33,6 @@
 	let serverAddress = $derived(`${data.settings.remote_server}:${data.settings.remote_port}`);
 	let pairVerb = $derived(paired ? 'Pair again' : 'Pair');
 	let servers = $state([]);
-	let pairingUnsupported = $state(false);
 	// Fields for pairing; a discovered server's Use button fills them, and
 	// while paired they hold the current server, for pairing again.
 	let pair = $state(untrack(() => pairFields(data.settings)));
@@ -44,6 +42,10 @@
 	// GET /api/status (0 in standalone mode).
 	let failed = $state(0);
 	let pending = $state(0);
+	// Why each failed save is in the failed list, from GET /api/outbox/failed:
+	// for a change another computer's newer value kept out, the record, the
+	// field and both values.
+	let failedList = $state([]);
 	// The connection state, from GET /api/status ('' in standalone mode).
 	let connState = $state('');
 	// A refused key and a changed certificate are both fixed by pairing again.
@@ -70,7 +72,6 @@
 		} catch {
 			return { ok: false, message: API_UNREACHABLE };
 		}
-		if (res.status === 404) return { ok: false, message: NOT_SUPPORTED };
 		if (!res.ok) return { ok: false, message: await readDetail(res) };
 		let answer = {};
 		try {
@@ -162,6 +163,12 @@
 		failed = remote ? Number(s.failed) || 0 : 0;
 		pending = remote ? Number(s.pending) || 0 : 0;
 		connState = remote ? String(s.state || '') : '';
+		if (failed > 0) {
+			const { status, data: list } = await pollJSON('/api/outbox/failed');
+			if (status === 200 && Array.isArray(list)) failedList = list;
+		} else {
+			failedList = [];
+		}
 		return code;
 	}
 
@@ -170,9 +177,8 @@
 		let stopped = false;
 		let timer;
 		const loop = async () => {
-			const code = await pollStatus();
-			// An older client has no status route: no point asking again this page load.
-			if (stopped || code === 404) return;
+			await pollStatus();
+			if (stopped) return;
 			timer = setTimeout(loop, STATUS_POLL_MS);
 		};
 		loop();
@@ -182,19 +188,14 @@
 		};
 	});
 
-	// The servers found on the network, while no server is set. An older
-	// client answers 404: pairing is not available then.
+	// The servers found on the network, while no server is set.
 	$effect(() => {
-		if (configured || pairingUnsupported) return;
+		if (configured) return;
 		let stopped = false;
 		let timer;
 		const loop = async () => {
 			const { status: code, data: list } = await pollJSON('/api/servers');
 			if (stopped) return;
-			if (code === 404) {
-				pairingUnsupported = true;
-				return;
-			}
 			if (code === 200 && Array.isArray(list)) servers = list;
 			timer = setTimeout(loop, SERVERS_POLL_MS);
 		};
@@ -309,8 +310,6 @@
 				{/if}
 				{@render pairForm(pairVerb)}
 			</div>
-		{:else if pairingUnsupported}
-			<div>{NOT_SUPPORTED}</div>
 		{:else}
 			<div>Servers on this network:</div>
 			{#each servers as s}
@@ -327,6 +326,11 @@
 			{@render pairForm('Pair')}
 		{/if}
 		{#if failed > 0}
+			<ul class="list-disc ml-6 text-sm">
+				{#each failedList as f, i (i)}
+					<li class="break-words">{f.reason || f.save}</li>
+				{/each}
+			</ul>
 			<div class="flex flex-row gap-1 items-center">
 				<div class={tS.red}>{saves(failed)} could not be sent</div>
 				<button

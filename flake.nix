@@ -16,7 +16,9 @@
     in
     {
       packages = forEachSystem (pkgs: {
-        default = pkgs.callPackage ./nix/package.nix { };
+        default = pkgs.callPackage ./nix/package.nix {
+          stamp = self.shortRev or self.dirtyShortRev or "0.0.1";
+        };
       });
 
       apps = forEachSystem (

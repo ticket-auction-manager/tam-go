@@ -147,6 +147,7 @@ func (l *client) request(ph *phase, op, method, path string, body, into any, row
 		if jerr := json.Unmarshal(data, into); jerr != nil {
 			err = fmt.Errorf("%s: %s %s: %w", l.prog.name, method, path, jerr)
 		}
+		valuesOnly(into)
 	}
 	if queued {
 		l.mu.Lock()

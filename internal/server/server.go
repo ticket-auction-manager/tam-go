@@ -13,16 +13,16 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"ticket-auction-manager/tam-go/internal/guard"
 	"ticket-auction-manager/tam-go/internal/httpx"
+	"ticket-auction-manager/tam-go/internal/presence"
 	"ticket-auction-manager/tam-go/internal/store"
+	"ticket-auction-manager/tam-go/internal/version"
 )
-
-// Version is the program version reported by GET /api.
-const Version = "0.0.1"
 
 // Password is the server password that protects key management. The admin
 // package's Password implements it; FixedPassword is enough for tests.
@@ -50,7 +50,7 @@ func FixedPassword(s string) Password { return fixedPassword(s) }
 // Info describes the server to its clients in the GET /api answer.
 type Info struct {
 	Name    string // shown to clients when pairing; defaults to the host name
-	Version string // defaults to Version
+	Version string // defaults to version.Version
 }
 
 // Option configures NewHandler.
@@ -69,6 +69,19 @@ func WithInfo(info Info) Option {
 	}
 }
 
+// WithPresence sets the registry that records what each key's client last
+// did: every keyed request is a sighting, an accepted POST or DELETE an
+// update, and the heartbeat's X-TAM-Pending its queued saves. The admin
+// page reads it. Without the option the handler fills a registry nobody
+// reads.
+func WithPresence(reg *presence.Registry) Option {
+	return func(h *handler) {
+		if reg != nil {
+			h.presence = reg
+		}
+	}
+}
+
 // WithGuesses sets the limit on wrong passwords, per address, that TAM-PW
 // counts against. Give the admin pages the same one (admin.WithGuesses), so
 // guesses cannot be split between the two; without the option the API
@@ -81,18 +94,24 @@ func WithGuesses(l *guard.Limiter) Option {
 	}
 }
 
-// touchEvery is how often at most a key's last_seen is written. It is a
-// variable so tests can lower it.
+// touchEvery is how often at most a key's last_seen and last_update are
+// written. It is a variable so tests can lower it.
 var touchEvery = time.Minute
 
+// maxClientLen caps the program name taken from a request header, which
+// the admin page shows.
+const maxClientLen = 80
+
 type handler struct {
-	st      *store.Store
-	pw      Password
-	info    Info
-	guesses *guard.Limiter
+	st       *store.Store
+	pw       Password
+	info     Info
+	presence *presence.Registry
+	guesses  *guard.Limiter
 
 	mu      sync.Mutex
 	touched map[string]time.Time // key -> last time last_seen was written
+	updated map[string]time.Time // key -> last time last_update was written
 }
 
 // NewHandler returns the server API. Data routes require a TAM-KEY header
@@ -100,10 +119,17 @@ type handler struct {
 // that pw accepts, and answers 503 while no password is set. Wrong passwords
 // count against the address they come from: after guard.MaxFailures of them
 // it has to wait (429). Unknown paths and wrong methods under /api answer
-// {"detail": ...} like the original.
+// {"detail": ...}. Every request with a valid key is recorded for the admin
+// page; see WithPresence.
 func NewHandler(st *store.Store, pw Password, opts ...Option) http.Handler {
 	hostname, _ := os.Hostname()
-	h := &handler{st: st, pw: pw, info: Info{Name: hostname, Version: Version}, guesses: guard.New(), touched: map[string]time.Time{}}
+	h := &handler{
+		st: st, pw: pw, info: Info{Name: hostname, Version: version.Version},
+		presence: presence.New(nil),
+		guesses:  guard.New(),
+		touched:  map[string]time.Time{},
+		updated:  map[string]time.Time{},
+	}
 	for _, opt := range opts {
 		opt(h)
 	}
@@ -165,42 +191,110 @@ func (h *handler) requireKey(next http.HandlerFunc) http.Handler {
 			return
 		}
 		h.touch(key)
-		next(w, r)
+		h.presence.Seen(key, clientOf(r))
+		if r.Method != http.MethodPost && r.Method != http.MethodDelete {
+			next(w, r)
+			return
+		}
+		// A write the handler accepted is an update of the shared data by
+		// that client.
+		sw := &statusWriter{ResponseWriter: w}
+		next(sw, r)
+		if sw.status == 0 {
+			sw.status = http.StatusOK
+		}
+		// A repeat of a save already applied (X-TAM-Stale) changed nothing.
+		if sw.status/100 == 2 && sw.Header().Get("X-TAM-Stale") == "" {
+			h.presence.Updated(key)
+			h.markUpdated(key)
+		}
 	})
 }
 
-// keyOf returns the request's access key. The original client sends it as
-// TAM_KEY on its server-backup download, so that spelling counts too.
-func keyOf(r *http.Request) string {
-	if key := r.Header.Get("TAM-KEY"); key != "" {
-		return key
+// statusWriter passes everything through and remembers the status sent.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if s.status == 0 {
+		s.status = code
 	}
-	return r.Header.Get("TAM_KEY")
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// keyOf returns the request's access key, from the TAM-KEY header.
+func keyOf(r *http.Request) string {
+	return r.Header.Get("TAM-KEY")
+}
+
+// clientOf names the program behind a request: the X-TAM-Client header
+// tam-client sends, else the first word of the User-Agent, else "unknown".
+func clientOf(r *http.Request) string {
+	name := strings.TrimSpace(r.Header.Get("X-TAM-Client"))
+	if name == "" {
+		if words := strings.Fields(r.UserAgent()); len(words) > 0 {
+			name = words[0]
+		}
+	}
+	if name == "" {
+		return "unknown"
+	}
+	if runes := []rune(name); len(runes) > maxClientLen {
+		name = string(runes[:maxClientLen])
+	}
+	return name
 }
 
 // touch records the key's last_seen time, at most once per touchEvery so
 // the heartbeat of every client does not turn into a write every 5 s. A
 // failure is logged and never fails the request; last_seen is informational.
 func (h *handler) touch(key string) {
-	now := time.Now()
-	h.mu.Lock()
-	last, seen := h.touched[key]
-	if seen && now.Sub(last) < touchEvery {
-		h.mu.Unlock()
-		return
-	}
-	h.touched[key] = now
-	h.mu.Unlock()
-	if err := h.st.TouchKey(key); err != nil {
-		log.Printf("record last_seen for a key: %v", err)
+	if h.due(h.touched, key) {
+		if err := h.st.TouchKey(key); err != nil {
+			log.Printf("record last_seen for a key: %v", err)
+		}
 	}
 }
 
-// forget drops the throttle entry of a deleted key.
+// markUpdated records the key's last_update time, throttled like touch.
+func (h *handler) markUpdated(key string) {
+	if h.due(h.updated, key) {
+		if err := h.st.MarkKeyUpdated(key); err != nil {
+			log.Printf("record last_update for a key: %v", err)
+		}
+	}
+}
+
+// due reports whether the key's entry in m is missing or older than
+// touchEvery and, when so, sets it to now.
+func (h *handler) due(m map[string]time.Time, key string) bool {
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if last, ok := m[key]; ok && now.Sub(last) < touchEvery {
+		return false
+	}
+	m[key] = now
+	return true
+}
+
+// forget drops the throttle entries and the presence record of a deleted
+// key.
 func (h *handler) forget(key string) {
 	h.mu.Lock()
 	delete(h.touched, key)
+	delete(h.updated, key)
 	h.mu.Unlock()
+	h.presence.Forget(key)
 }
 
 // requirePassword lets a request through when its TAM-PW is the password.
@@ -241,16 +335,34 @@ func (h *handler) root(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if authed {
-		h.touch(key) // the client's heartbeat is this route
+		// The client's heartbeat is this route; X-TAM-Pending on it says
+		// how many saves still wait on the client.
+		h.touch(key)
+		if pending, err := strconv.Atoi(r.Header.Get("X-TAM-Pending")); err == nil && pending >= 0 {
+			h.presence.Heartbeat(key, clientOf(r), pending)
+		} else {
+			h.presence.Seen(key, clientOf(r))
+		}
 	}
-	httpx.WriteJSON(w, http.StatusOK, map[string]any{
+	ev, err := h.st.Event()
+	if err != nil {
+		httpx.WriteInternal(w, err)
+		return
+	}
+	doc := map[string]any{
 		"whoami": "TAM Server", "authenticated": authed, "healthy": true,
 		"name": h.info.Name, "version": h.info.Version,
-	})
+	}
+	// The event the server holds: a client whose copy is of another event
+	// sets that copy aside (see sync's event check).
+	if ev != nil {
+		doc["event"] = ev.Event
+	}
+	httpx.WriteJSON(w, http.StatusOK, doc)
 }
 
-// errOrder is a save whose name and number (X-TAM-Client-Name, X-TAM-Save) do
-// not make sense.
+// errOrder is a save without a sensible name and number (X-TAM-Client-Name,
+// X-TAM-Save).
 var errOrder = errors.New("X-TAM-Client-Name must name the client, in at most 64 characters, and X-TAM-Save number its save, above 0")
 
 // behindError is a numbered save older than the last one applied from its
@@ -261,20 +373,18 @@ func (e behindError) Error() string {
 	return fmt.Sprintf("save %d of this client is older than its save %d, which the server has applied; send it again with a number above %d", e.n, e.last, e.last)
 }
 
-// ordered runs a save in the order the client made it when the request
-// numbers it, as tam-client does (see store.InOrder). A repeat of the last
-// save applied from that client is not applied again, and the answer says
-// so with X-TAM-Stale; the client takes it as done. An older save is not
-// applied either, and is answered 409 with the last number applied
-// (X-TAM-Last-Save, and last_save in the body), so a client whose numbers
-// went back numbers it again and resends it. Saves without numbers, as the
-// original client sends them, apply as they come. content is the save as
-// decoded (nil when the path says it all), for the save's digest.
+// ordered runs a save in the order the client made it: every save names
+// its client and number (X-TAM-Client-Name, X-TAM-Save), as tam-client sends
+// them (see store.InOrder). A repeat of the last save applied from that
+// client is not applied again, and the answer says so with X-TAM-Stale; the
+// client takes it as done. An older save is not applied either, and is
+// answered 409 with the last number applied (X-TAM-Last-Save, and last_save
+// in the body), so a client whose numbers went back numbers it again and
+// resends it. A save without a name and number is refused (400). content is
+// the save as decoded (nil when the path says it all), for the save's
+// digest.
 func (h *handler) ordered(w http.ResponseWriter, r *http.Request, content any, save func(*store.Store) error) (stale bool, err error) {
 	client, number := r.Header.Get("X-TAM-Client-Name"), r.Header.Get("X-TAM-Save")
-	if client == "" && number == "" {
-		return false, save(h.st)
-	}
 	n, perr := strconv.ParseInt(number, 10, 64)
 	if client == "" || len(client) > 64 || perr != nil || n <= 0 {
 		return false, errOrder
@@ -426,15 +536,19 @@ func (h *handler) listPrefixes(w http.ResponseWriter, r *http.Request) {
 	respond(w, ps, err)
 }
 
+// The save routes write each form's saves field by field (see store's
+// saves) and answer with the rows as stored afterwards, in the order of the
+// saves: the client sees from them which changes were not made, because
+// another computer changed the field first, and writes them into its copy.
+
 func (h *handler) postPrefixes(w http.ResponseWriter, r *http.Request) {
-	ps, ok := decodeList(w, r, store.ValidatePrefixes)
+	saves, ok := decodeList(w, r, store.ValidatePrefixSaves)
 	if !ok {
 		return
 	}
-	if _, ok := h.write(w, r, ps, func(st *store.Store) error { return st.UpsertPrefixes(ps) }); !ok {
-		return
-	}
-	httpx.WriteJSON(w, http.StatusOK, ps)
+	var stored []store.Prefix
+	saveRoute(h, w, r, saves, func(st *store.Store) (err error) { stored, err = st.SavePrefixes(saves); return err },
+		&stored, func(sv store.PrefixSave) (*store.Prefix, error) { return h.st.PrefixByName(sv.Prefix.Prefix) })
 }
 
 func (h *handler) deletePrefix(w http.ResponseWriter, r *http.Request) {
@@ -495,14 +609,13 @@ func (h *handler) ticketRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postTickets(w http.ResponseWriter, r *http.Request) {
-	ts, ok := decodeList(w, r, store.ValidateTickets)
+	saves, ok := decodeList(w, r, store.ValidateTicketSaves)
 	if !ok {
 		return
 	}
-	if _, ok := h.write(w, r, ts, func(st *store.Store) error { return st.UpsertTickets(ts) }); !ok {
-		return
-	}
-	httpx.WriteJSON(w, http.StatusOK, ts)
+	var stored []store.Ticket
+	saveRoute(h, w, r, saves, func(st *store.Store) (err error) { stored, err = st.SaveTickets(saves); return err },
+		&stored, func(sv store.TicketSave) (*store.Ticket, error) { return h.st.Ticket(sv.Prefix, sv.TID) })
 }
 
 func (h *handler) searchTickets(w http.ResponseWriter, r *http.Request) {
@@ -544,14 +657,13 @@ func (h *handler) basketRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postBaskets(w http.ResponseWriter, r *http.Request) {
-	bs, ok := decodeList(w, r, store.ValidateBaskets)
+	saves, ok := decodeList(w, r, store.ValidateBasketSaves)
 	if !ok {
 		return
 	}
-	if _, ok := h.write(w, r, bs, func(st *store.Store) error { return st.UpsertBaskets(bs) }); !ok {
-		return
-	}
-	httpx.WriteJSON(w, http.StatusOK, bs)
+	var stored []store.Basket
+	saveRoute(h, w, r, saves, func(st *store.Store) (err error) { stored, err = st.SaveBaskets(saves); return err },
+		&stored, func(sv store.BasketSave) (*store.Basket, error) { return h.st.Basket(sv.Prefix, sv.BID) })
 }
 
 // --- drawing ---
@@ -587,14 +699,41 @@ func (h *handler) drawingRange(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) postDrawing(w http.ResponseWriter, r *http.Request) {
-	bs, ok := decodeList(w, r, store.ValidateBaskets)
+	saves, ok := decodeList(w, r, store.ValidateDrawingSaves)
 	if !ok {
 		return
 	}
-	if _, ok := h.write(w, r, bs, func(st *store.Store) error { return st.UpsertWinning(bs) }); !ok {
+	var stored []store.Basket
+	saveRoute(h, w, r, saves, func(st *store.Store) (err error) { stored, err = st.SaveWinning(saves); return err },
+		&stored, func(sv store.DrawingSave) (*store.Basket, error) { return h.st.Basket(sv.Prefix, sv.BID) })
+}
+
+// saveRoute runs a save in its client's order (see write) and answers with
+// the rows as stored. A repeat of a save already applied answers with the
+// rows as they are now, read with current.
+func saveRoute[S any, R any](h *handler, w http.ResponseWriter, r *http.Request, saves []S, save func(*store.Store) error,
+	stored *[]R, current func(S) (*R, error)) {
+	stale, ok := h.write(w, r, saves, save)
+	if !ok {
 		return
 	}
-	httpx.WriteJSON(w, http.StatusOK, bs)
+	if stale {
+		rows := make([]R, 0, len(saves))
+		for _, sv := range saves {
+			row, err := current(sv)
+			if err != nil {
+				httpx.WriteInternal(w, err)
+				return
+			}
+			if row == nil {
+				httpx.WriteError(w, http.StatusConflict, "a row of this save is gone from the server")
+				return
+			}
+			rows = append(rows, *row)
+		}
+		*stored = rows
+	}
+	httpx.WriteJSON(w, http.StatusOK, *stored)
 }
 
 // --- reports ---
@@ -621,6 +760,9 @@ func (h *handler) exportBackup(w http.ResponseWriter, r *http.Request) {
 	respond(w, bf, err)
 }
 
+// importBackup restores a backup file: its rows replace the server's. With
+// X-TAM-Merge: newer it merges a client's copy instead (Push), writing only
+// the rows newer than the server's (see store.MergeNewer).
 func (h *handler) importBackup(w http.ResponseWriter, r *http.Request) {
 	var bf store.BackupFile
 	if err := httpx.DecodeJSON(w, r, &bf); err != nil {
@@ -629,6 +771,21 @@ func (h *handler) importBackup(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := store.ValidateBackup(&bf); err != nil {
 		httpx.WriteError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if r.Header.Get("X-TAM-Merge") == "newer" {
+		res, err := h.st.MergeNewer(bf)
+		switch {
+		case errors.Is(err, store.ErrOtherEvent):
+			httpx.WriteError(w, http.StatusConflict, "This client's copy belongs to another event than the one this server holds; nothing was written.")
+		case err != nil:
+			httpx.WriteInternal(w, err)
+		default:
+			httpx.WriteJSON(w, http.StatusOK, map[string]any{
+				"message": fmt.Sprintf("%d rows added and %d updated; %d were as new or newer on the server and stayed.", res.Added, res.Updated, res.Kept),
+				"added":   res.Added, "updated": res.Updated, "kept": res.Kept,
+			})
+		}
 		return
 	}
 	if err := h.st.Import(bf); err != nil {
