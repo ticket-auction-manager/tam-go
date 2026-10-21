@@ -1,42 +1,17 @@
 <script>
-	import hotkeys from 'hotkeys-js';
 	import { bS, iS } from '../styles';
+	import { altShortcuts } from '../shortcuts';
 
 	let { prefix, functions, pager = $bindable() } = $props();
 
-	$effect(() => {
-		hotkeys.filter = () => {
-			return true;
-		};
-		const selectFrom = (e) => {
-			e.preventDefault();
-			const id_from = document.getElementById('id_from');
-			if (id_from) id_from.select();
-		};
-		const selectTo = (e) => {
-			e.preventDefault();
-			const id_to = document.getElementById('id_to');
-			if (id_to) id_to.select();
-		};
-		const prevPage = (e) => {
-			e.preventDefault();
-			if (functions.prevPage) functions.prevPage();
-		};
-		const nextPage = (e) => {
-			e.preventDefault();
-			if (functions.nextPage) functions.nextPage();
-		};
-		hotkeys('alt+q', selectFrom);
-		hotkeys('alt+w', selectTo);
-		hotkeys('alt+b', prevPage);
-		hotkeys('alt+n', nextPage);
-		return () => {
-			hotkeys.unbind('alt+q', selectFrom);
-			hotkeys.unbind('alt+w', selectTo);
-			hotkeys.unbind('alt+b', prevPage);
-			hotkeys.unbind('alt+n', nextPage);
-		};
-	});
+	$effect(() =>
+		altShortcuts({
+			q: () => document.getElementById('id_from')?.select(),
+			w: () => document.getElementById('id_to')?.select(),
+			b: () => functions.prevPage?.(),
+			n: () => functions.nextPage?.()
+		})
+	);
 </script>
 
 <div class="flex flex-row justify-between gap-1 p-1">
