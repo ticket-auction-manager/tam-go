@@ -56,7 +56,7 @@
 			>
 		{/if}
 		{#if functions.cancel}
-			<!-- No shortcut: Alt + S is Save Marked. -->
+			<!-- No shortcut: Alt + S is Save All. -->
 			<button
 				class={bS[prefix.color]}
 				onclick={() => {

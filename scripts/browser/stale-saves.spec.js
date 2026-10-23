@@ -55,7 +55,7 @@ test('a page saving over a newer value shows the newer value and says so', async
   });
   await page.getByRole('textbox', { name: 'Ticket 1 phone number', exact: true }).fill('555-0777');
   await page.getByRole('textbox', { name: 'Ticket 2 last name', exact: true }).fill('Raye');
-  await page.getByRole('button', { name: 'Save Marked', exact: true }).click();
+  await page.getByRole('button', { name: 'Save All', exact: true }).click();
 
   await expect.poll(() => dialogs.length).toBe(1);
   expect(dialogs[0]).toContain('another computer changed');
@@ -67,7 +67,7 @@ test('a page saving over a newer value shows the newer value and says so', async
   expect(two.last_name).toBe('Raye');
   // Typing it again, from the value now shown, replaces it deliberately.
   await page.getByRole('textbox', { name: 'Ticket 1 phone number', exact: true }).fill('555-0777');
-  await page.getByRole('button', { name: 'Save Marked', exact: true }).click();
+  await page.getByRole('button', { name: 'Save All', exact: true }).click();
   await expect.poll(() => serverPhone(request, event)).toBe('555-0777');
   expect(dialogs).toHaveLength(1);
 });
@@ -77,7 +77,7 @@ test('an offline save that arrives after a newer one waits in Settings for Retry
   await openTickets(page, event.a);
   event.a.link.setOnline(false);
   await page.getByRole('textbox', { name: 'Ticket 1 phone number', exact: true }).fill('555-0777');
-  await page.getByRole('button', { name: 'Save Marked', exact: true }).click();
+  await page.getByRole('button', { name: 'Save All', exact: true }).click();
   await expect(page.locator('tbody').getByRole('button', { name: 'Yes', exact: true })).toHaveCount(0);
 
   await correctOnB(request, event);
@@ -110,7 +110,7 @@ test('a winner from a page loaded before another winner was entered does not rep
     await dialog.accept();
   });
   await page.getByRole('spinbutton', { name: 'Basket 1 winning ticket', exact: true }).fill('1');
-  await page.getByRole('button', { name: 'Save Marked', exact: true }).click();
+  await page.getByRole('button', { name: 'Save All', exact: true }).click();
   await expect.poll(() => dialogs.length).toBe(1);
   expect(dialogs[0]).toContain('Basket 1 winning ticket: now "2", yours was "1"');
   await expect(page.getByRole('spinbutton', { name: 'Basket 1 winning ticket', exact: true })).toHaveValue('2');
