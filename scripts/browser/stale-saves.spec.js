@@ -78,7 +78,7 @@ test('an offline save that arrives after a newer one waits in Settings for Retry
   event.a.link.setOnline(false);
   await page.getByRole('textbox', { name: 'Ticket 1 phone number', exact: true }).fill('555-0777');
   await page.getByRole('button', { name: 'Save All', exact: true }).click();
-  await expect(page.locator('tbody').getByRole('button', { name: 'Yes', exact: true })).toHaveCount(0);
+  await expect(page.locator('tbody').getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(0);
 
   await correctOnB(request, event);
   event.a.link.setOnline(true);
