@@ -98,7 +98,7 @@ for (const form of forms) {
       if (leave === 'hidden') {
         // Assert before closing: a working beforeunload hook must not mask
         // a broken visibility hook. Coming back must keep the edit position.
-        await expect(page.locator('tbody').getByRole('button', { name: 'No', exact: true })).toHaveCount(2);
+        await expect(page.locator('tbody').getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(2);
         await page.evaluate(() => {
           delete document.visibilityState;
           delete document.hidden;
