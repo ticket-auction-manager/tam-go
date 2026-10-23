@@ -170,7 +170,7 @@
 			focusIdx(curIdx);
 		}
 	};
-	const headers = ['Basket ID', 'Description', 'Winning Ticket', 'Winner', 'Save?'];
+	const headers = ['Basket ID', 'Description', 'Winning Ticket', 'Winner', 'Actions'];
 
 	// Marked rows are saved when the page is hidden, left or closed.
 	$effect(() => saveOnLeave(() => itemsBuffer, (opts) => functions.save(opts)));
@@ -231,15 +231,44 @@
 				<td class="p-0.5 border">
 					{item.last_name || ''}, {item.first_name || ''}: {item.phone_number || ''}
 				</td>
-				<td class="p-0.5 border"
-					><button
-						class={bS[prefix.color]}
-						tabindex="-1"
-						onclick={() => {
-							item.changed ? (item.changed = false) : (item.changed = true);
-						}}>{item.changed ? 'Yes' : 'No'}</button
-					></td
-				>
+				<td class="p-0.5 border">
+          <div class="flex flex-row gap-1">
+            {#if item.changed}
+              <button
+                class={bS[prefix.color]}
+                tabindex="-1"
+                onclick={async () => {
+                  const problem = await saveMarked("/api/drawing", [item], {
+                    form: DRAWING_FORM,
+                  });
+                  if (!problem) {
+                    item.changed = false;
+                  } else {
+                    alert(problem);
+                  };
+                  focusIdx(idx);
+                }}>Save</button
+              >
+              <button
+                class={bS[prefix.color]}
+                tabindex="-1"
+                onclick={async () => {
+                  const exData = await getJSON(
+                    `/api/drawing/${encodeURIComponent(prefix.prefix)}/${item.b_id}`,
+                  );
+                  [
+                    item.winning_ticket,
+                  ] = [
+                    exData.winning_ticket || 0,
+                  ];
+                  if (!item.pref) item.pref = defaultPref;
+                  item.changed = false;
+                  focusIdx(idx);
+                }}>Cancel</button
+              >
+            {/if}
+          </div>
+        </td>
 			</tr>
 		{:else}
 			<tr>

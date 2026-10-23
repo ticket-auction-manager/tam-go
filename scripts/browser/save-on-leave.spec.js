@@ -71,7 +71,7 @@ for (const form of forms) {
           .or(page.getByRole('spinbutton', { name: form.labels[i], exact: true }))
           .fill(String(form.values[i]));
       }
-      await expect(page.locator('tbody').getByRole('button', { name: 'Yes', exact: true })).toHaveCount(2);
+      await expect(page.locator('tbody').getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(2);
 
       if (leave === 'hidden') {
         // Headless Chromium keeps tabs visible. Exercise the browser's
@@ -98,7 +98,7 @@ for (const form of forms) {
       if (leave === 'hidden') {
         // Assert before closing: a working beforeunload hook must not mask
         // a broken visibility hook. Coming back must keep the edit position.
-        await expect(page.locator('tbody').getByRole('button', { name: 'No', exact: true })).toHaveCount(2);
+        await expect(page.locator('tbody').getByRole('button', { name: 'Cancel', exact: true })).toHaveCount(2);
         await page.evaluate(() => {
           delete document.visibilityState;
           delete document.hidden;

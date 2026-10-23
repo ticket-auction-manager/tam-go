@@ -52,11 +52,11 @@
 	<div class="flex flex-row gap-1">
 		{#if functions.save}
 			<button class={bS[prefix.color]} title="Alt + S" onclick={() => functions.save()}
-				>Save Marked</button
+				>Save All</button
 			>
 		{/if}
 		{#if functions.cancel}
-			<!-- No shortcut: Alt + S is Save Marked. -->
+			<!-- No shortcut: Alt + S is Save All. -->
 			<button
 				class={bS[prefix.color]}
 				onclick={() => {
@@ -66,7 +66,7 @@
 					if (yes_no) {
 						functions.cancel();
 					}
-				}}>Cancel Marked</button
+				}}>Cancel All</button
 			>
 		{/if}
 	</div>
